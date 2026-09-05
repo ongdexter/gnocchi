@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.8)
+project(gnocchi)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(mavros_msgs REQUIRED)
+find_package(GTSAM REQUIRED)
+find_package(GTSAM_UNSTABLE REQUIRED)
+find_package(Eigen3 REQUIRED)
+
+add_executable(gnocchi_node src/gnocchi_node.cpp src/pose_graph.cpp)
+target_include_directories(gnocchi_node PRIVATE include ${EIGEN3_INCLUDE_DIR})
+ament_target_dependencies(gnocchi_node rclcpp nav_msgs sensor_msgs std_msgs geometry_msgs tf2_ros mavros_msgs)
+target_link_libraries(gnocchi_node gtsam gtsam_unstable)
+target_link_directories(gnocchi_node PRIVATE ${GTSAM_UNSTABLE_LIBRARY_DIRS} /opt/ros/$ENV{ROS_DISTRO}/lib/x86_64-linux-gnu)
+
+install(TARGETS gnocchi_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+install(FILES README.md DESTINATION share/${PROJECT_NAME})
+
+ament_package()

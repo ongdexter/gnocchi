@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gnocchi</name>
+  <version>0.1.0</version>
+  <description>
+    GNOCCHI: Global Navigation from Odometry Constraints and
+    Covariance-weighted Heading with Incremental Smoothing.
+
+    Globally referenced pose estimation. Odometry enters the graph only as
+    relative constraints; GNSS position and heading enter as priors, weighted
+    by the accuracy the receiver reports.
+    One frame, pose only. With no odometry configured it degenerates into a
+    GNSS-to-local-frame converter, which is the UAV profile.
+  </description>
+  <maintainer email="odexter@engineering.upenn.edu">odexter</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>mavros_msgs</depend>
+  <depend>gtsam</depend>
+  <depend>eigen</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

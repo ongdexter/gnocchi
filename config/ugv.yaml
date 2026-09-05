@@ -1,0 +1,68 @@
+# UGV: RKO-LIO odometry with GNSS position and dual-antenna heading priors.
+# Fuses the RAW fix: it reports the antenna, so the lever arm applies, and it is
+# a measurement rather than an estimator posterior. See README for the rest.
+/**/gnocchi:
+  ros__parameters:
+    topics:
+      odom: rko_lio/odometry
+      gnss: mavros/global_position/raw/fix
+      # Every GPS instance; whichever reports a valid yaw is used.
+      gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      output_odom: odom_map
+      output_pose: pose_map
+    extrinsics:
+      # GNSS antenna in base_link (FLU)
+      gnss_antenna: {x: -0.15, y: -0.25, z: 0.0}
+    frames:
+      # ENU / UTM, absolute.
+      world: world
+      # NWU: +X north, +Y west. Origin is the first accepted fix.
+      map: ugv_map
+      map_yaw_deg: 90.0
+      odom: odom
+      base_link: base_link
+      expect_odom_child: base_link
+    publish_tf: true
+    keyframe:
+      distance: 0.5
+      angle_deg: 10.0
+      max_time: 1.0
+    odom:
+      # Translation is where lidar odometry is strong.
+      translation_floor: 0.02
+      # Loose: heading is the better yaw reference, so do not lock in lidar's.
+      rotation_floor: 0.1
+      translation_sigma_per_m: 0.02
+      rotation_sigma_per_m: 0.005
+      rotation_sigma_per_rad: 0.02
+      # Gravity-aligned odometry's own roll/pitch; yaw is the heading prior's.
+      attitude_sigma: 0.05
+      # Gravity-aligned odometry holds z; GNSS altitude is not fused.
+      z_sigma: 0.1
+    gnss:
+      min_interval: 5.0
+      sigma: 0.5   # raw fix; its own reported sigma is ~0.30
+      max_sigma: 2.0
+      robust_k: 1.345
+      # Altitude is not fused: it is the weakest axis of the fix and the lidar
+      # odometry's z is better, so letting them fight only injects corrections.
+      fuse_altitude: false
+      sigma_z: 3.0
+    heading:
+      min_interval: 0.0
+      # Bounds on the receiver-reported hdg_acc. The floor stops an
+      # over-confident report pinning yaw absolutely; the ceiling rejects
+      # headings the receiver already knows are bad, e.g. on RTK loss.
+      gnss_sigma_floor: 0.005
+      gnss_sigma_max: 0.35
+    origin_z_sigma: 0.5
+    max_measurement_age: 0.5
+    optimizer:
+      fixed_lag: false
+      lag_time: 30.0
+      min_keyframes: 5
+
+    debug:
+      # Publishes the pose GNSS alone would give, to overlay in RViz.
+      publish_gnss_only: true
+      gnss_only_topic: debug/gnss_only

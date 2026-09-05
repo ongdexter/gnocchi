@@ -1,0 +1,27 @@
+# UAV: GPS-only. topics.odom empty means no clock, no keyframes, no graph -- the
+# node becomes a GNSS-to-local-frame converter. No IMU: the output pose's yaw
+# comes from the heading prior, but roll/pitch is always level (0). UNVERIFIED
+# on real UAV data.
+/**/gnocchi:
+  ros__parameters:
+    topics:
+      odom: ""
+      gnss: mavros/global_position/global
+      # Every GPS instance; whichever reports a valid yaw is used.
+      gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      output_odom: odom_map
+      output_pose: pose_map
+    extrinsics:
+      # GNSS antenna in base_link (FLU)
+      gnss_antenna: {x: -0.15, y: -0.25, z: 0.0}
+    frames:
+      # ENU / UTM, absolute.
+      world: world
+      # NWU: +X north, +Y west. Origin is the first accepted fix.
+      map: uav_map
+      map_yaw_deg: 90.0
+      base_link: base_link
+    publish_tf: false
+    gnss:
+      sigma: 0.5
+      max_sigma: 3.0
