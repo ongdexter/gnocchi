@@ -28,11 +28,16 @@
       angle_deg: 10.0
       max_time: 1.0
     odom:
-      # Translation is where lidar odometry is strong.
-      translation_floor: 0.02
-      # Loose: heading is the better yaw reference, so do not lock in lidar's.
-      rotation_floor: 0.1
-      translation_sigma_per_m: 0.02
+      # Translation is where lidar odometry is strong: rigid over a short window,
+      # so the fused pose follows the lidar locally.
+      translation_floor: 0.005
+      # Loose enough that heading still owns yaw, but ~5x tighter than the lidar's
+      # measured per-keyframe yaw drift rather than ~70x.
+      rotation_floor: 0.02
+      # This, not gnss.sigma, sets the distance over which GNSS may deform the
+      # chain: with a rigid chain the solution is just its best rigid fit to the
+      # GNSS priors, and scaling all those sigmas together does not move it.
+      translation_sigma_per_m: 0.05
       rotation_sigma_per_m: 0.005
       rotation_sigma_per_rad: 0.02
       # Gravity-aligned odometry's own roll/pitch; yaw is the heading prior's.
@@ -40,7 +45,10 @@
       # Gravity-aligned odometry holds z; GNSS altitude is not fused.
       z_sigma: 0.1
     gnss:
-      min_interval: 5.0
+      # The fix's error is ~3 cm of noise on a ~0.5 m bias that decorrelates over
+      # 20-40 s, so samples closer together than this carry no new information and
+      # only make the graph overconfident in the GNSS frame.
+      min_interval: 30.0
       sigma: 0.5   # raw fix; its own reported sigma is ~0.30
       max_sigma: 2.0
       robust_k: 1.345
@@ -49,7 +57,27 @@
       fuse_altitude: false
       sigma_z: 3.0
     heading:
+      # Dual-antenna heading error is white once it is timed correctly, so every
+      # keyframe may have one.
       min_interval: 0.0
+      # The message is stamped later than the epoch it describes. Measured on this
+      # airframe: the residual against odometry correlates with yaw rate at -0.88
+      # and collapses from 4.15 to 1.26 deg -- its own claimed accuracy -- at
+      # -0.240 s. RE-MEASURE THIS if the receiver, link or mavros version changes.
+      # It measured 218 / 243 / 267 ms across three runs, but the response is flat
+      # from roughly -0.18 to -0.45, so being in the right region is what matters and
+      # the exact value does not. Re-measure with gnocchi_tuning/lag_across_runs.py
+      # if the receiver, link or mavros version changes.
+      time_offset: -0.240
+      # Huber, whitened. Survives the occasional bad baseline without letting it
+      # rotate the graph.
+      robust_k: 1.345
+      # Do not interpolate a heading across a gap longer than this.
+      max_gap: 1.0
+      # Skip the prior while the heading slews faster than this. Any residual lag
+      # error costs yaw_rate * error, so mid-turn priors are the least trustworthy.
+      # 0 disables. See below: with the lag corrected this buys little, so it is off.
+      max_rate: 0.0
       # Bounds on the receiver-reported hdg_acc. The floor stops an
       # over-confident report pinning yaw absolutely; the ceiling rejects
       # headings the receiver already knows are bad, e.g. on RTK loss.

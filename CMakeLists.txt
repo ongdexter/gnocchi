@@ -27,6 +27,7 @@ target_link_libraries(gnocchi_node gtsam gtsam_unstable)
 target_link_directories(gnocchi_node PRIVATE ${GTSAM_UNSTABLE_LIBRARY_DIRS} /opt/ros/$ENV{ROS_DISTRO}/lib/x86_64-linux-gnu)
 
 install(TARGETS gnocchi_node DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/measure_heading_lag.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(FILES README.md DESTINATION share/${PROJECT_NAME})
 

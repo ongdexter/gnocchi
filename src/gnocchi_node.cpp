@@ -50,6 +50,10 @@ public:
         o.max_measurement_age = get("max_measurement_age", o.max_measurement_age);
         o.gnss_min_interval = get("gnss.min_interval", o.gnss_min_interval);
         o.heading_min_interval = get("heading.min_interval", o.heading_min_interval);
+        o.heading_time_offset = get("heading.time_offset", o.heading_time_offset);
+        o.heading_robust_k = get("heading.robust_k", o.heading_robust_k);
+        o.heading_max_gap = get("heading.max_gap", o.heading_max_gap);
+        o.heading_max_rate = get("heading.max_rate", o.heading_max_rate);
         o.use_fixed_lag = this->declare_parameter("optimizer.fixed_lag", false);
         o.lag_time = get("optimizer.lag_time", o.lag_time);
         o.min_keyframes = static_cast<size_t>(this->declare_parameter("optimizer.min_keyframes", 5));

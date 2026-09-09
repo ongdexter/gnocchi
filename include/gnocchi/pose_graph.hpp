@@ -13,6 +13,7 @@
 
 #include <Eigen/Dense>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <optional>
 
@@ -62,6 +63,22 @@ struct Options
     // over tens of seconds so it is spaced out; dual-antenna heading is not.
     double gnss_min_interval = 0.0;
     double heading_min_interval = 0.0;
+
+    // The heading is reported with a transport lag, so its stamp is later than the
+    // epoch it describes; this is added to the stamp. Measure it per airframe: on
+    // the UGV the residual against odometry correlates with yaw rate until roughly
+    // -0.24 s, and mis-association costs yaw_rate * lag, which dwarfs the sigma
+    // during a turn.
+    double heading_time_offset = 0.0;   // s
+    // Huber on the heading prior, whitened. A moving-baseline heading throws
+    // occasional large outliers that a bare Gaussian has to absorb by bending yaw.
+    double heading_robust_k = 0.0;      // 0 disables
+    // Widest gap between the samples bracketing a keyframe still worth interpolating.
+    double heading_max_gap = 1.0;       // s
+    // Skip the prior when the heading is slewing faster than this: whatever lag
+    // correction is left over costs yaw_rate * error, so a mid-turn prior is the
+    // least trustworthy one. 0 disables the gate.
+    double heading_max_rate = 0.0;      // rad/s
 
     bool use_fixed_lag = false;
     double lag_time = 30.0;           // s
@@ -122,7 +139,12 @@ private:
     bool tryInitialize(int64_t stamp_ns, const Eigen::Isometry3d& odom);
     void createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom);
     void optimize(int64_t stamp_ns);
+    // Attaches each buffered keyframe's heading once samples bracketing its time
+    // exist, so the prior lands on the pose it actually describes.
+    void attachHeadings();
+    bool due(int64_t last, double interval, int64_t stamp_ns) const;
     gtsam::SharedNoiseModel gnssNoise(double sigma) const;
+    gtsam::SharedNoiseModel headingNoise(double sigma) const;
     void addAttitudeFactor(size_t key, const Eigen::Isometry3d& odom);
     static double yawOf(const Eigen::Matrix3d& r);
     void addVerticalFactor(size_t key, const Eigen::Isometry3d& odom);
@@ -162,6 +184,23 @@ private:
     Measurement gnss_meta_;
     double heading_ = 0.0;
     Measurement heading_meta_;
+
+    // Heading is buffered rather than consumed newest-first: attaching whatever
+    // arrived last dates the prior by the transport lag plus the keyframe spacing,
+    // which is an error proportional to yaw rate.
+    struct HeadingSample
+    {
+        int64_t stamp_ns = 0;
+        double yaw = 0.0;
+        double sigma = 0.0;
+    };
+    struct PendingKeyframe
+    {
+        size_t key = 0;
+        int64_t stamp_ns = 0;
+    };
+    std::deque<HeadingSample> heading_buf_;
+    std::deque<PendingKeyframe> pending_kf_;
 };
 
 }  // namespace gnocchi

@@ -42,8 +42,82 @@ void PoseGraph::setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sig
 void PoseGraph::setHeading(int64_t stamp_ns, double yaw_enu, double sigma)
 {
     if (!std::isfinite(yaw_enu) || !std::isfinite(sigma) || sigma <= 0.0) return;
+    // Corrected to the epoch the measurement actually describes before it is used
+    // for anything.
+    const int64_t t =
+        stamp_ns + static_cast<int64_t>(options_.heading_time_offset * 1e9);
+    if (!heading_buf_.empty() && t <= heading_buf_.back().stamp_ns) return;
+    heading_buf_.push_back({t, yaw_enu, sigma});
+    while (heading_buf_.size() > 512) heading_buf_.pop_front();
+    // Still kept for initialisation, which only needs some heading, not the right one.
     heading_ = yaw_enu;
-    heading_meta_ = {stamp_ns, sigma, true};
+    heading_meta_ = {t, sigma, true};
+}
+
+bool PoseGraph::due(int64_t last, double interval, int64_t stamp_ns) const
+{
+    return last == 0 || interval <= 0.0 ||
+           static_cast<double>(stamp_ns - last) * 1e-9 >= interval;
+}
+
+gtsam::SharedNoiseModel PoseGraph::headingNoise(double sigma) const
+{
+    // Yaw only: roll and pitch get a free sigma so this constrains one axis.
+    gtsam::SharedNoiseModel base =
+        gtsam::noiseModel::Diagonal::Sigmas(gtsam::Vector3(1e2, 1e2, sigma));
+    if (options_.heading_robust_k <= 0.0) return base;
+    // A dropped RTK baseline sends yaw out by tens of degrees for a few samples;
+    // without this the graph has to rotate to accommodate them.
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Huber::Create(options_.heading_robust_k), base);
+}
+
+void PoseGraph::attachHeadings()
+{
+    while (!pending_kf_.empty())
+    {
+        const PendingKeyframe kf = pending_kf_.front();
+        // Interpolation needs a sample on each side, and the later one arrives
+        // only after the keyframe: leave it pending and retry on the next one.
+        if (heading_buf_.empty() || heading_buf_.back().stamp_ns < kf.stamp_ns)
+        {
+            if (pending_kf_.size() <= 64) return;
+            pending_kf_.pop_front();
+            continue;
+        }
+        pending_kf_.pop_front();
+
+        size_t j = 0;
+        while (j < heading_buf_.size() && heading_buf_[j].stamp_ns < kf.stamp_ns) ++j;
+        if (j == 0) continue;  // nothing before it; the buffer starts too late
+        const HeadingSample& a = heading_buf_[j - 1];
+        const HeadingSample& b = heading_buf_[j];
+        const int64_t at = a.stamp_ns, bt = b.stamp_ns;
+        const double gap = static_cast<double>(bt - at) * 1e-9;
+        if (gap > options_.heading_max_gap) continue;
+        if (!due(last_heading_attached_ns_, options_.heading_min_interval, kf.stamp_ns))
+            continue;
+
+        // Interpolate the short way round, so a wrap between samples cannot spin
+        // the interpolated heading the long way.
+        const double step = std::atan2(std::sin(b.yaw - a.yaw), std::cos(b.yaw - a.yaw));
+        // Whatever lag correction is left over costs yaw_rate * error, so a prior
+        // taken mid-turn is the least trustworthy one there is.
+        if (options_.heading_max_rate > 0.0 && gap > 0.0 &&
+            std::abs(step / gap) > options_.heading_max_rate)
+            continue;
+        const double w =
+            gap > 0.0 ? static_cast<double>(kf.stamp_ns - at) /
+                            static_cast<double>(bt - at)
+                      : 0.0;
+        const double yaw = a.yaw + w * step;
+        graph_.addExpressionFactor(
+            gtsam::rotation(X(kf.key)),
+            gtsam::Rot3::Ypr(std::atan2(std::sin(yaw), std::cos(yaw)), 0.0, 0.0),
+            headingNoise(std::max(a.sigma, b.sigma)));
+        heading_attached_++;
+        last_heading_attached_ns_ = kf.stamp_ns;
+    }
 }
 
 void PoseGraph::addAttitudeFactor(size_t key, const Eigen::Isometry3d& odom)
@@ -51,21 +125,41 @@ void PoseGraph::addAttitudeFactor(size_t key, const Eigen::Isometry3d& odom)
     if (options_.odom_attitude_sigma <= 0.0) return;
     // Gravity-direction factor: genuinely 2-DOF and yaw invariant, so it cannot
     // fight the heading prior.
-    const Eigen::Vector3d body_up_in_world = odom.rotation() * Eigen::Vector3d::UnitZ();
+    //
+    // The measurement has to be the body-frame direction of up, not the odometry-
+    // frame direction of body up: odom and the graph's ENU differ by the start
+    // heading, and asking for world_R_b * e3 == odom_R_b * e3 is only satisfiable
+    // by rotating the whole solution until world_R_b == odom_R_b, which silently
+    // undoes that heading. Gravity alignment makes this form yaw invariant.
+    const Eigen::Vector3d up_in_body =
+        odom.rotation().transpose() * Eigen::Vector3d::UnitZ();
     graph_.add(gtsam::Pose3AttitudeFactor(
-        X(key), gtsam::Unit3(body_up_in_world),
+        X(key), gtsam::Unit3(Eigen::Vector3d::UnitZ()),
         gtsam::noiseModel::Isotropic::Sigma(2, options_.odom_attitude_sigma),
-        gtsam::Unit3(Eigen::Vector3d::UnitZ())));
+        gtsam::Unit3(up_in_body)));
 }
+
+namespace
+{
+// Reads a pose's z, so the vertical measurement can be exactly 1-DOF.
+double zOfPoint(const gtsam::Point3& p, gtsam::OptionalJacobian<1, 3> H)
+{
+    if (H) *H << 0.0, 0.0, 1.0;
+    return p.z();
+}
+}  // namespace
 
 void PoseGraph::addVerticalFactor(size_t key, const Eigen::Isometry3d& odom)
 {
     if (options_.odom_z_sigma <= 0.0) return;
-    // Vertical only: huge horizontal sigmas leave x and y entirely to GNSS.
-    graph_.add(gtsam::GPSFactor(
-        X(key), gtsam::Point3(0.0, 0.0, odom.translation().z() + z_offset_),
-        gtsam::noiseModel::Diagonal::Sigmas(
-            gtsam::Vector3(1e3, 1e3, options_.odom_z_sigma))));
+    // Vertical only, and genuinely 1-DOF. A 3-DOF factor with a large but finite
+    // horizontal sigma is not the same as no horizontal constraint: every keyframe
+    // then pulls weakly towards x=y=0, and over hundreds of them that sums to an
+    // effective sigma small enough to shrink the trajectory towards the origin.
+    graph_.addExpressionFactor(
+        gtsam::Double_(&zOfPoint, gtsam::translation(gtsam::Pose3_(X(key)))),
+        odom.translation().z() + z_offset_,
+        gtsam::noiseModel::Isotropic::Sigma(1, options_.odom_z_sigma));
 }
 
 double PoseGraph::yawOf(const Eigen::Matrix3d& r)
@@ -185,29 +279,18 @@ void PoseGraph::createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom)
 
     // Attached here, as the keyframe is built, so a node cannot be optimized before
     // its own constraints exist.
-    const auto due = [&](int64_t last, double interval) {
-        return last == 0 || interval <= 0.0 ||
-               static_cast<double>(stamp_ns - last) * 1e-9 >= interval;
-    };
-    if (fresh(gnss_meta_, stamp_ns) && due(last_gnss_attached_ns_, options_.gnss_min_interval))
+    if (fresh(gnss_meta_, stamp_ns) &&
+        due(last_gnss_attached_ns_, options_.gnss_min_interval, stamp_ns))
     {
         graph_.add(gtsam::GPSFactor(X(key), gnss_, gnssNoise(gnss_meta_.sigma)));
         gnss_meta_.valid = false;
         gnss_attached_++;
         last_gnss_attached_ns_ = stamp_ns;
     }
-    if (fresh(heading_meta_, stamp_ns) &&
-        due(last_heading_attached_ns_, options_.heading_min_interval))
-    {
-        // Yaw only: roll and pitch get a free sigma so this constrains one axis.
-        graph_.addExpressionFactor(
-            gtsam::rotation(X(key)), gtsam::Rot3::Ypr(heading_, 0.0, 0.0),
-            gtsam::noiseModel::Diagonal::Sigmas(
-                gtsam::Vector3(1e2, 1e2, heading_meta_.sigma)));
-        heading_meta_.valid = false;
-        heading_attached_++;
-        last_heading_attached_ns_ = stamp_ns;
-    }
+    // Heading is queued instead: its prior is attached once samples bracketing this
+    // keyframe's time exist, which is one keyframe later but on the right pose.
+    pending_kf_.push_back({key, stamp_ns});
+    attachHeadings();
     addAttitudeFactor(key, odom);
     addVerticalFactor(key, odom);
 
