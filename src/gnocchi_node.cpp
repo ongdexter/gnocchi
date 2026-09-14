@@ -77,6 +77,32 @@ public:
         // NWU (+X north, +Y west); 0 would leave the map frame ENU.
         map_yaw_ = this->declare_parameter("frames.map_yaw_deg", 90.0) * M_PI / 180.0;
         publish_tf_ = this->declare_parameter("publish_tf", true);
+        const bool enable_gnss = this->declare_parameter("enable_gnss", true);
+        if (!enable_gnss)
+        {
+            if (publish_tf_)
+            {
+                static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+                geometry_msgs::msg::TransformStamped world_to_map;
+                world_to_map.header.stamp = this->now();
+                world_to_map.header.frame_id = world_frame_;
+                world_to_map.child_frame_id = map_frame_;
+                world_to_map.transform.rotation.w = 1.0;
+                auto map_to_odom = world_to_map;
+                map_to_odom.header.frame_id = map_frame_;
+                map_to_odom.child_frame_id = odom_frame_;
+                static_tf_->sendTransform(
+                    std::vector<geometry_msgs::msg::TransformStamped>{world_to_map, map_to_odom});
+                RCLCPP_INFO(this->get_logger(),
+                            "GNSS disabled: publishing static identity %s -> %s -> %s",
+                            world_frame_.c_str(), map_frame_.c_str(), odom_frame_.c_str());
+            }
+            else
+            {
+                RCLCPP_INFO(this->get_logger(), "GNSS and TF publishing disabled; node is idle");
+            }
+            return;
+        }
         // The graph runs in local ENU about the datum; this rotates its output
         // into the map frame's axes.
         map_from_local_ = gtsam::Rot3::Rz(-map_yaw_);

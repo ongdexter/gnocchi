@@ -29,6 +29,14 @@ ros2 launch gnocchi uav.launch.py    # UAV
 Both take `use_sim_time`, and `config` if you need to point at a config file
 other than each launch file's default (`ugv.yaml` / `uav.yaml`).
 
+For indoor UGV testing, set `enable_gnss: false` in `config/ugv.yaml` and
+restart gnocchi. With `publish_tf: true`, the node immediately publishes static
+identity transforms `world -> ugv_map -> odom`, using the configured frame names.
+This mode ignores the datum and `frames.map_yaw_deg`, subscribes to no sensors,
+and publishes no pose or odometry estimates. The odometry source still owns
+`odom -> base_link`. `enable_gnss` defaults to `true`; set it back to `true` and
+restart for normal GNSS operation. `publish_tf: false` suppresses TF in either mode.
+
 When replaying a bag, start the node **before** playback and play with
 `--clock` — it needs a fix and a heading before it can anchor the origin, and
 `optimizer.min_keyframes` (default 5) keyframes of motion after that before it

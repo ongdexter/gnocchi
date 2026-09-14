@@ -4,6 +4,7 @@
 # on real UAV data.
 /**/gnocchi:
   ros__parameters:
+    enable_gnss: true
     topics:
       odom: ""
       gnss: mavros/global_position/global

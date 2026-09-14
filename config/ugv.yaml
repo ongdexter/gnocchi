@@ -2,7 +2,8 @@
 # Fuses the RAW fix: it reports the antenna, so the lever arm applies, and it is
 # a measurement rather than an estimator posterior. See README for the rest.
 /**/gnocchi:
-  ros__parameters:
+  ros__parameters:    
+    enable_gnss: true # false: only publish static identity world -> ugv_map -> odom for indoor tests.
     topics:
       odom: rko_lio/odometry
       gnss: mavros/global_position/raw/fix
