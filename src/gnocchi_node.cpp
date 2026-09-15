@@ -7,6 +7,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <mavros_msgs/msg/gpsraw.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 
@@ -42,6 +43,12 @@ public:
         // Bounds on the receiver's reported hdg_acc.
         gnss_heading_sigma_floor_ = get("heading.gnss_sigma_floor", 0.005);
         gnss_heading_sigma_max_ = get("heading.gnss_sigma_max", 0.35);
+        // Dual-antenna moving-baseline heading needs a receiver that actually
+        // supports it. Where it isn't available, fall back to the FCU's own
+        // compass_hdg estimate -- worse accuracy, no per-message reported
+        // sigma (it's a bare Float64), so a fixed sigma is assumed instead.
+        use_gnss_heading_ = this->declare_parameter("heading.use_gnss_heading", true);
+        compass_heading_sigma_ = get("heading.compass_sigma_deg", 5.0) * M_PI / 180.0;
         o.odom_attitude_sigma = get("odom.attitude_sigma", o.odom_attitude_sigma);
         o.odom_z_sigma = get("odom.z_sigma", o.odom_z_sigma);
         o.gnss_fuse_altitude = this->declare_parameter("gnss.fuse_altitude", false);
@@ -140,20 +147,31 @@ public:
             this->declare_parameter("topics.gnss", std::string("fix")),
             rclcpp::SensorDataQoS(),
             std::bind(&GnocchiNode::onGnss, this, std::placeholders::_1), opts);
-        // GPS_RAW_INT carries the receiver's own yaw and its accuracy. Every instance is
-        // subscribed; which one has the moving-baseline heading is wiring, not fixed.
-        const auto heading_topics = this->declare_parameter<std::vector<std::string>>(
-            "topics.gnss_heading",
-            {"mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"});
-        for (const auto& topic : heading_topics)
+        if (use_gnss_heading_)
         {
-            gnss_heading_subs_.push_back(
-                this->create_subscription<mavros_msgs::msg::GPSRAW>(
-                    topic, rclcpp::SensorDataQoS(),
-                    [this, topic](const mavros_msgs::msg::GPSRAW::ConstSharedPtr m) {
-                        onGnssHeading(m, topic);
-                    },
-                    opts));
+            // GPS_RAW_INT carries the receiver's own yaw and its accuracy. Every instance is
+            // subscribed; which one has the moving-baseline heading is wiring, not fixed.
+            const auto heading_topics = this->declare_parameter<std::vector<std::string>>(
+                "topics.gnss_heading",
+                {"mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"});
+            for (const auto& topic : heading_topics)
+            {
+                gnss_heading_subs_.push_back(
+                    this->create_subscription<mavros_msgs::msg::GPSRAW>(
+                        topic, rclcpp::SensorDataQoS(),
+                        [this, topic](const mavros_msgs::msg::GPSRAW::ConstSharedPtr m) {
+                            onGnssHeading(m, topic);
+                        },
+                        opts));
+            }
+        }
+        else
+        {
+            const auto compass_topic = this->declare_parameter(
+                "heading.compass_topic", std::string("mavros/global_position/compass_hdg"));
+            compass_heading_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+                compass_topic, rclcpp::SensorDataQoS(),
+                std::bind(&GnocchiNode::onCompassHeading, this, std::placeholders::_1), opts);
         }
 
 
@@ -172,15 +190,21 @@ public:
             this->declare_parameter("topics.output_pose", std::string("pose_map")), 10);
 
 
+        const char* heading_source = use_gnss_heading_
+            ? "dual-antenna GNSS moving-baseline heading"
+            : "FCU compass_hdg heading (fixed sigma)";
         if (gps_only_)
             RCLCPP_INFO(this->get_logger(),
-                        "gnocchi up: GPS-only (no odometry, no graph). "
+                        "gnocchi up: GPS-only (no odometry, no graph), heading from %s. "
                         "%s -> %s (static, %.0f deg), output in %s at the fix rate",
+                        heading_source,
                         world_frame_.c_str(), map_frame_.c_str(), map_yaw_ * 180.0 / M_PI,
                         map_frame_.c_str());
         else
             RCLCPP_INFO(this->get_logger(),
-                        "gnocchi up: %s -> %s (static, %.0f deg) -> %s (live), output in %s",
+                        "gnocchi up: heading from %s. "
+                        "%s -> %s (static, %.0f deg) -> %s (live), output in %s",
+                        heading_source,
                         world_frame_.c_str(), map_frame_.c_str(), map_yaw_ * 180.0 / M_PI,
                         odom_frame_.c_str(), map_frame_.c_str());
     }
@@ -373,6 +397,24 @@ private:
         graph_->setHeading(gnss_heading_ns_, heading_, sigma);
     }
 
+    // Fallback when heading.use_gnss_heading is false: the FCU's own fused
+    // heading estimate (typically magnetic compass, possibly GPS-course-aided
+    // in forward flight), same compass-bearing convention as GPSRAW's yaw but
+    // in plain degrees. A bare Float64 carries no accuracy or timestamp, so a
+    // fixed sigma is assumed and the node's own clock stands in for a stamp.
+    void onCompassHeading(const std_msgs::msg::Float64::ConstSharedPtr msg)
+    {
+        const double enu = M_PI / 2.0 - msg->data * M_PI / 180.0;
+        RCLCPP_INFO_ONCE(this->get_logger(),
+                         "Compass heading in use (fixed sigma %.2f deg)",
+                         compass_heading_sigma_ * 180.0 / M_PI);
+        heading_ = std::atan2(std::sin(enu), std::cos(enu));
+        have_heading_ = true;
+        last_heading_sigma_ = compass_heading_sigma_;
+        gnss_heading_ns_ = this->now().nanoseconds();
+        graph_->setHeading(gnss_heading_ns_, heading_, compass_heading_sigma_);
+    }
+
 
     // world -> map: a translation to the datum plus the map frame's yaw. Static,
     // because the datum is fixed once the first fix is accepted.
@@ -472,6 +514,9 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss_sub_;
     std::vector<rclcpp::Subscription<mavros_msgs::msg::GPSRAW>::SharedPtr> gnss_heading_subs_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr compass_heading_sub_;
+    bool use_gnss_heading_ = true;
+    double compass_heading_sigma_ = 5.0 * M_PI / 180.0;
     double gnss_heading_sigma_floor_ = 0.005, gnss_heading_sigma_max_ = 0.35;
     int64_t gnss_heading_ns_ = 0;
 

@@ -12,6 +12,13 @@
       gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
       output_odom: odom_map
       output_pose: pose_map
+    heading:
+      # Dual-antenna moving-baseline heading needs a receiver that supports it.
+      # Set false to fall back to heading.compass_topic (mavros' compass_hdg,
+      # default mavros/global_position/compass_hdg) instead -- worse accuracy,
+      # and no per-message sigma, so heading.compass_sigma_deg (default 5.0) is
+      # assumed fixed.
+      use_gnss_heading: true
     extrinsics:
       # GNSS antenna in base_link (FLU)
       gnss_antenna: {x: -0.15, y: -0.25, z: 0.0}
