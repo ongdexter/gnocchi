@@ -113,8 +113,15 @@ public:
         graph_ = std::make_unique<PoseGraph>(o);
         if (publish_tf_)
         {
-            tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
             static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+            // gps_only has no odom frame to hand a live correction to, and no
+            // other node's output it may claim instead (e.g. a VIO source
+            // publishing its own map -> base_link) -- so it only ever gets the
+            // static world -> map edge below, never a live broadcaster.
+            if (!gps_only_)
+            {
+                tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+            }
         }
 
         // One mutually exclusive group for every input, so the graph is touched from
@@ -436,21 +443,20 @@ private:
         pose_msg.pose = msg.pose.pose;
         pose_pub_->publish(pose_msg);
 
-        if (!publish_tf_) return;
-        // map -> odom, the live alignment. With no odometry there is no odom frame, so
-        // the edge goes to base_link; only enable publish_tf then if nothing else
-        // claims base_link.
-        const gtsam::Pose3 l = gps_only_ ? gtsam::Pose3(pose.rotation(), pose.translation())
-                                         : graph_->worldFromOdom();
-        const gtsam::Pose3 c = gps_only_
-                                   ? l
-                                   : gtsam::Pose3(map_from_local_ * l.rotation(),
-                                                  map_from_local_ * l.translation());
+        // gps_only has no odom frame, and nothing in this stack looks up base_link
+        // via TF -- every consumer reads the pose off this topic instead. So gnocchi
+        // only ever hands out world -> map; leave base_link to whatever owns it
+        // (e.g. a VIO source's own map -> base_link).
+        if (!publish_tf_ || gps_only_) return;
+        // map -> odom, the live alignment.
+        const gtsam::Pose3 l = graph_->worldFromOdom();
+        const gtsam::Pose3 c = gtsam::Pose3(map_from_local_ * l.rotation(),
+                                             map_from_local_ * l.translation());
         const gtsam::Quaternion cq = c.rotation().toQuaternion();
         geometry_msgs::msg::TransformStamped tf;
         tf.header.stamp = stamp;
         tf.header.frame_id = map_frame_;
-        tf.child_frame_id = gps_only_ ? base_frame_ : odom_frame_;
+        tf.child_frame_id = odom_frame_;
         tf.transform.translation.x = c.translation().x();
         tf.transform.translation.y = c.translation().y();
         tf.transform.translation.z = c.translation().z();

@@ -22,7 +22,12 @@
       map: uav_map
       map_yaw_deg: 90.0
       base_link: base_link
-    publish_tf: false
+    # gps_only (no topics.odom) never gets a live TF edge to base_link -- nothing
+    # in this stack looks up base_link via TF, and it would conflict with the
+    # ZED's own VIO output (driver_launch's pos_tracking.publish_tf), which does
+    # own it. publish_tf here only turns on the static world -> uav_map edge that
+    # waypoint conversion and cross-vehicle frame reprojection need.
+    publish_tf: true
     gnss:
       sigma: 0.5
       max_sigma: 3.0
