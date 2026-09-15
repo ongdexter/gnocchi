@@ -147,6 +147,17 @@ public:
             this->declare_parameter("topics.gnss", std::string("fix")),
             rclcpp::SensorDataQoS(),
             std::bind(&GnocchiNode::onGnss, this, std::placeholders::_1), opts);
+        // Optional: a fused relative-altitude topic (e.g. mavros' rel_alt, itself
+        // barometer+GPS+IMU fused by the FCU) in place of the raw single-fix GNSS
+        // altitude for the output pose's z. Empty (default) keeps the old behavior.
+        const auto rel_altitude_topic = this->declare_parameter(
+            "topics.rel_altitude", std::string(""));
+        if (!rel_altitude_topic.empty())
+        {
+            rel_altitude_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+                rel_altitude_topic, rclcpp::SensorDataQoS(),
+                std::bind(&GnocchiNode::onRelAltitude, this, std::placeholders::_1), opts);
+        }
         if (use_gnss_heading_)
         {
             // GPS_RAW_INT carries the receiver's own yaw and its accuracy. Every instance is
@@ -296,10 +307,20 @@ private:
                                           msg->position_covariance[8]});
         const double sigma = std::isfinite(variance) && variance > 1e-9 ? std::sqrt(variance) : 0.0;
         Eigen::Vector3d local = Eigen::Vector3d(easting, northing, msg->altitude) - datum_;
+        // rel_altitude is already relative to home (and FCU-fused, not a raw
+        // single fix), so it replaces the datum-differenced z outright rather
+        // than needing datum_.z() subtracted from it too.
+        if (have_rel_altitude_) local.z() = rel_altitude_;
         local -= leverArmOffset();
         graph_->setGnss(ns(msg->header.stamp), local, sigma);
         if (gps_only_) publishGpsOnly(local, sigma, msg->header.stamp);
         if (debug_gnss_only_) publishGnssOnlyDebug(local, msg->header.stamp);
+    }
+
+    void onRelAltitude(const std_msgs::msg::Float64::ConstSharedPtr msg)
+    {
+        rel_altitude_ = msg->data;
+        have_rel_altitude_ = true;
     }
 
     // Antenna offset from the body origin, in local ENU. No roll/pitch source, so
@@ -513,6 +534,9 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr rel_altitude_sub_;
+    bool have_rel_altitude_ = false;
+    double rel_altitude_ = 0.0;
     std::vector<rclcpp::Subscription<mavros_msgs::msg::GPSRAW>::SharedPtr> gnss_heading_subs_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr compass_heading_sub_;
     bool use_gnss_heading_ = true;

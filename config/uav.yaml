@@ -10,6 +10,9 @@
       gnss: mavros/global_position/global
       # Every GPS instance; whichever reports a valid yaw is used.
       gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      # FCU-fused (baro+GPS+IMU) altitude relative to home, in place of the raw
+      # single-fix GNSS altitude for the output pose's z.
+      rel_altitude: mavros/global_position/rel_alt
       output_odom: odom_map
       output_pose: pose_map
     heading:
