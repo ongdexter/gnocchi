@@ -100,14 +100,26 @@ public:
                 map_to_odom.child_frame_id = odom_frame_;
                 static_tf_->sendTransform(
                     std::vector<geometry_msgs::msg::TransformStamped>{world_to_map, map_to_odom});
-                RCLCPP_INFO(this->get_logger(),
-                            "GNSS disabled: publishing static identity %s -> %s -> %s",
-                            world_frame_.c_str(), map_frame_.c_str(), odom_frame_.c_str());
             }
-            else
+            const auto odom_topic = this->declare_parameter("topics.odom", std::string("odom"));
+            if (odom_topic.empty())
             {
-                RCLCPP_INFO(this->get_logger(), "GNSS and TF publishing disabled; node is idle");
+                RCLCPP_INFO(this->get_logger(), "GNSS and odometry both disabled; node is idle");
+                return;
             }
+            // LIO passthrough
+            pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
+                this->declare_parameter("topics.output_odom", std::string("odom_map")), 10);
+            pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+                this->declare_parameter("topics.output_pose", std::string("pose_map")), 10);
+            odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                odom_topic, rclcpp::SensorDataQoS(),
+                std::bind(&GnocchiNode::onOdomPassthrough, this, std::placeholders::_1));
+            RCLCPP_INFO(this->get_logger(),
+                        "GNSS disabled: LIO passthrough. %s -> %s -> %s identity (static), "
+                        "relaying %s as odom_map/pose_map unfused and unheaded",
+                        world_frame_.c_str(), map_frame_.c_str(), odom_frame_.c_str(),
+                        odom_topic.c_str());
             return;
         }
         // The graph runs in local ENU about the datum; this rotates its output
@@ -272,6 +284,25 @@ private:
                                  graph_->headingAttached());
         }
         publishFused(stamp);
+    }
+
+    // enable_gnss:=false path only: map/world/odom are identity (see
+    // constructor), so the incoming pose needs no transform at all, just
+    // relabeling into gnocchi's output frames/topics.
+    void onOdomPassthrough(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+    {
+        frameOk(msg->header.frame_id, odom_frame_, "odometry");
+        frameOk(msg->child_frame_id, expected_odom_child_, "odometry child");
+
+        nav_msgs::msg::Odometry out = *msg;
+        out.header.frame_id = map_frame_;
+        out.child_frame_id = base_frame_;
+        pub_->publish(out);
+
+        geometry_msgs::msg::PoseStamped pose_msg;
+        pose_msg.header = out.header;
+        pose_msg.pose = out.pose.pose;
+        pose_pub_->publish(pose_msg);
     }
 
     void publishFused(int64_t stamp_ns)
