@@ -7,10 +7,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <mavros_msgs/msg/gpsraw.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -84,6 +86,21 @@ public:
         // NWU (+X north, +Y west); 0 would leave the map frame ENU.
         map_yaw_ = this->declare_parameter("frames.map_yaw_deg", 90.0) * M_PI / 180.0;
         publish_tf_ = this->declare_parameter("publish_tf", true);
+        publishing_enabled_ = !this->declare_parameter("publish_on_trigger", false);
+        const auto initialization_trigger_topic = this->declare_parameter(
+            "initialization_trigger_topic", std::string("/initialization_trigger"));
+        if (!publishing_enabled_)
+        {
+            initialization_trigger_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+                initialization_trigger_topic, rclcpp::QoS(10),
+                [this](const std_msgs::msg::Bool::ConstSharedPtr msg) {
+                    if (msg->data && !publishing_enabled_.exchange(true))
+                        RCLCPP_INFO(this->get_logger(),
+                                    "Initialization trigger received; pose publishing enabled");
+                });
+            RCLCPP_INFO(this->get_logger(), "Waiting for initialization trigger on %s before publishing poses",
+                        initialization_trigger_topic.c_str());
+        }
         const bool enable_gnss = this->declare_parameter("enable_gnss", true);
         if (!enable_gnss)
         {
@@ -145,9 +162,9 @@ public:
 
         // One mutually exclusive group for every input, so the graph is touched from
         // one callback at a time.
-        auto group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        sensor_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         auto opts = rclcpp::SubscriptionOptions();
-        opts.callback_group = group;
+        opts.callback_group = sensor_group_;
 
         if (!gps_only_)
         {
@@ -291,6 +308,7 @@ private:
     // relabeling into gnocchi's output frames/topics.
     void onOdomPassthrough(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
+        if (!publishing_enabled_) return;
         frameOk(msg->header.frame_id, odom_frame_, "odometry");
         frameOk(msg->child_frame_id, expected_odom_child_, "odometry child");
 
@@ -387,6 +405,7 @@ private:
     void publishGnssOnlyDebug(const Eigen::Vector3d& local,
                               const builtin_interfaces::msg::Time& stamp)
     {
+        if (!publishing_enabled_) return;
         const auto pose = gnssOnlyPose(local);
         if (!pose) return;
         const gtsam::Pose3 m(map_from_local_ * pose->rotation(),
@@ -489,6 +508,7 @@ private:
 
     void publish(const gtsam::Pose3& local_pose, const builtin_interfaces::msg::Time& stamp)
     {
+        if (!publishing_enabled_) return;
         const gtsam::Pose3 pose(map_from_local_ * local_pose.rotation(),
                                 map_from_local_ * local_pose.translation());
         const gtsam::Point3 t = pose.translation();
@@ -562,6 +582,9 @@ private:
     }
 
     std::unique_ptr<PoseGraph> graph_;
+    rclcpp::CallbackGroup::SharedPtr sensor_group_;
+    std::atomic<bool> publishing_enabled_{true};
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr initialization_trigger_sub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gnss_sub_;

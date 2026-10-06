@@ -29,6 +29,15 @@ ros2 launch gnocchi uav.launch.py    # UAV
 Both take `use_sim_time`, and `config` if you need to point at a config file
 other than each launch file's default (`ugv.yaml` / `uav.yaml`).
 
+`publish_on_trigger` is enabled in the UAV config and disabled in the UGV
+config (the node default is `false`). When enabled, `pose_map`, `odom_map`,
+the optional debug pose, and live TF wait for a `std_msgs/msg/Bool` message
+with `data: true` on `initialization_trigger_topic` (default `/initialization_trigger`).
+Publishing starts with the next eligible sensor update and stays enabled until
+restart; false or repeated triggers do not stop or reset it. Sensor processing,
+datum initialization, and static TF continue while waiting. This also gates
+odometry passthrough when GNSS is disabled.
+
 For indoor UGV testing, set `enable_gnss: false` in `config/ugv.yaml` and
 restart gnocchi. With `publish_tf: true`, the node immediately publishes static
 identity transforms `world -> ugv_map -> odom`, using the configured frame names.

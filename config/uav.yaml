@@ -5,6 +5,8 @@
 /**/gnocchi:
   ros__parameters:
     enable_gnss: true
+    publish_on_trigger: true
+    initialization_trigger_topic: /initialization_trigger
     topics:
       odom: ""
       gnss: mavros/global_position/global
