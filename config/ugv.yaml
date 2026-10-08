@@ -53,7 +53,7 @@
       # Fix errors remain correlated over ~20-40 s: faster fusion also follows
       # GPS bias more strongly and does not establish calibrated uncertainty.
       min_interval: 1.0
-      sigma: 0.5   # raw fix; its own reported sigma is ~0.30
+      sigma: 1.0   # floor tuned to reduce position jitter with one-second priors
       max_sigma: 2.0
       robust_k: 1.345
       # Altitude is not fused: it is the weakest axis of the fix and the lidar
