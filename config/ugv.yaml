@@ -48,10 +48,11 @@
       # Gravity-aligned odometry holds z; GNSS altitude is not fused.
       z_sigma: 0.1
     gnss:
-      # The fix's error is ~3 cm of noise on a ~0.5 m bias that decorrelates over
-      # 20-40 s, so samples closer together than this carry no new information and
-      # only make the graph overconfident in the GNSS frame.
-      min_interval: 30.0
+      # One-second minimum between position factors improves drift tracking and
+      # GPS recovery in bag tests; factors attach at eligible keyframes.
+      # Fix errors remain correlated over ~20-40 s: faster fusion also follows
+      # GPS bias more strongly and does not establish calibrated uncertainty.
+      min_interval: 1.0
       sigma: 0.5   # raw fix; its own reported sigma is ~0.30
       max_sigma: 2.0
       robust_k: 1.345
