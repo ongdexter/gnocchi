@@ -86,6 +86,12 @@ public:
         // NWU (+X north, +Y west); 0 would leave the map frame ENU.
         map_yaw_ = this->declare_parameter("frames.map_yaw_deg", 90.0) * M_PI / 180.0;
         publish_tf_ = this->declare_parameter("publish_tf", true);
+        throttled_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            this->declare_parameter("topics.output_pose_throttled",
+                                    std::string("pose_map_throttled")), rclcpp::QoS(1));
+        throttled_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
+            this->declare_parameter("topics.output_odom_throttled",
+                                    std::string("odom_map_throttled")), rclcpp::QoS(1));
         publishing_enabled_ = !this->declare_parameter("publish_on_trigger", false);
         const auto initialization_trigger_topic = this->declare_parameter(
             "initialization_trigger_topic", std::string("/initialization_trigger"));
@@ -315,12 +321,26 @@ private:
         nav_msgs::msg::Odometry out = *msg;
         out.header.frame_id = map_frame_;
         out.child_frame_id = base_frame_;
-        pub_->publish(out);
+        publishOutputs(out);
+    }
 
+    void publishOutputs(const nav_msgs::msg::Odometry& msg)
+    {
+        pub_->publish(msg);
         geometry_msgs::msg::PoseStamped pose_msg;
-        pose_msg.header = out.header;
-        pose_msg.pose = out.pose.pose;
+        pose_msg.header = msg.header;
+        pose_msg.pose = msg.pose.pose;
         pose_pub_->publish(pose_msg);
+        // Sample fresh output at most once per second of node time. Preserve
+        // the measurement stamp; never repeat stale poses when inputs stop.
+        const auto now = this->now();
+        if (!last_throttled_publish_ || now < *last_throttled_publish_ ||
+            (now - *last_throttled_publish_).nanoseconds() >= 1000000000LL)
+        {
+            throttled_pose_pub_->publish(pose_msg);
+            throttled_odom_pub_->publish(msg);
+            last_throttled_publish_ = now;
+        }
     }
 
     void publishFused(int64_t stamp_ns)
@@ -550,12 +570,7 @@ private:
                 msg.pose.covariance[i * 6 + (j + 3)] = C(3 + i, j);        // trans-rot
                 msg.pose.covariance[(i + 3) * 6 + j] = C(i, 3 + j);        // rot-trans
             }
-        pub_->publish(msg);
-
-        geometry_msgs::msg::PoseStamped pose_msg;
-        pose_msg.header = msg.header;
-        pose_msg.pose = msg.pose.pose;
-        pose_pub_->publish(pose_msg);
+        publishOutputs(msg);
 
         // gps_only has no odom frame, and nothing in this stack looks up base_link
         // via TF -- every consumer reads the pose off this topic instead. So gnocchi
@@ -608,6 +623,9 @@ private:
     double last_heading_sigma_ = 0.005;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr throttled_pose_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr throttled_odom_pub_;
+    std::optional<rclcpp::Time> last_throttled_publish_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr gnss_only_pub_;
     bool debug_gnss_only_ = false;
 

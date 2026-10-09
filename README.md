@@ -30,7 +30,7 @@ Both take `use_sim_time`, and `config` if you need to point at a config file
 other than each launch file's default (`ugv.yaml` / `uav.yaml`).
 
 `publish_on_trigger` is enabled in the UAV config and disabled in the UGV
-config (the node default is `false`). When enabled, `pose_map`, `odom_map`,
+config (the node default is `false`). When enabled, `pose_map`, `pose_map_throttled`, `odom_map`, `odom_map_throttled`,
 the optional debug pose, and live TF wait for a `std_msgs/msg/Bool` message
 with `data: true` on `initialization_trigger_topic` (default `/initialization_trigger`).
 Publishing starts with the next eligible sensor update and stays enabled until
@@ -64,12 +64,28 @@ no attitude source at all beyond yaw: the GPS-only output pose is always
 level (roll/pitch = 0), with yaw from the heading prior. This profile is
 UNVERIFIED on real UAV data.
 
-**Outputs**, both carrying the same pose from the same call:
+**Outputs**, carrying the same pose from the same call:
 
 | topic | type | frame |
 |---|---|---|
 | `odom_map` | `nav_msgs/Odometry` | `ugv_map` / `uav_map` |
 | `pose_map` | `geometry_msgs/PoseStamped` | same |
+| `odom_map_throttled` | `nav_msgs/Odometry` | same |
+| `pose_map_throttled` | `geometry_msgs/PoseStamped` | same |
+
+`pose_map_throttled` and `odom_map_throttled` sample their full-rate outputs
+together at at most 1 Hz for other robots,
+preserving their measurement timestamps and frames, including all odometry
+covariance and twist fields. The shared throttle publishes the first eligible
+pose immediately, then the first new pose at least one second after the previous
+publication. It uses the node clock (including simulated time), resumes immediately
+after a backward clock jump, and does not repeat stale poses when inputs stop.
+This applies to fused, GPS-only, and GNSS-disabled passthrough modes. The relative
+topic defaults to `/ugv/pose_map_throttled` or `/uav/pose_map_throttled` under the
+provided launches; override `topics.output_pose_throttled` to rename it. QoS is
+reliable, volatile, with depth 1. The odometry topic similarly defaults to
+`/ugv/odom_map_throttled` or `/uav/odom_map_throttled` and is configurable via
+`topics.output_odom_throttled`. The original outputs retain their full rate.
 
 plus, when `publish_tf: true`, the static `world -> *_map` and the live
 `*_map -> odom` (or `-> base_link` in GPS-only mode, since there is no odom

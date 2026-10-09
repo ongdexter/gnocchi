@@ -12,7 +12,9 @@
       # Every GPS instance; whichever reports a valid yaw is used.
       gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
       output_odom: odom_map
+      output_odom_throttled: odom_map_throttled
       output_pose: pose_map
+      output_pose_throttled: pose_map_throttled
     extrinsics:
       # GNSS antenna in base_link (FLU)
       gnss_antenna: {x: -0.15, y: -0.25, z: 0.0}

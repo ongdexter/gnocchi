@@ -16,7 +16,9 @@
       # single-fix GNSS altitude for the output pose's z.
       rel_altitude: mavros/global_position/rel_alt
       output_odom: odom_map
+      output_odom_throttled: odom_map_throttled
       output_pose: pose_map
+      output_pose_throttled: pose_map_throttled
     heading:
       # Dual-antenna moving-baseline heading needs a receiver that supports it.
       # Set false to fall back to heading.compass_topic (mavros' compass_hdg,
