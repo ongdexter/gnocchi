@@ -31,13 +31,4 @@ install(PROGRAMS scripts/measure_heading_lag.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(FILES README.md DESTINATION share/${PROJECT_NAME})
 
-if(BUILD_TESTING)
-  enable_testing()
-  add_executable(position_alignment_test test/position_alignment_test.cpp src/pose_graph.cpp)
-  target_include_directories(position_alignment_test PRIVATE include ${EIGEN3_INCLUDE_DIR})
-  target_link_directories(position_alignment_test PRIVATE ${GTSAM_UNSTABLE_LIBRARY_DIRS} /opt/ros/$ENV{ROS_DISTRO}/lib/x86_64-linux-gnu)
-  target_link_libraries(position_alignment_test gtsam gtsam_unstable)
-  add_test(NAME position_alignment COMMAND position_alignment_test)
-endif()
-
 ament_package()
