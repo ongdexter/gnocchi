@@ -15,7 +15,7 @@ using gtsam::symbol_shorthand::X;
 namespace gnocchi
 {
 
-PoseGraph::PoseGraph(const Options& options) : options_(options)
+PoseGraph::PoseGraph(const Options& options) : alignment_(options.alignment), options_(options)
 {
     gtsam::ISAM2Params params;
     params.setRelinearizeThreshold(0.1);
@@ -35,12 +35,21 @@ bool PoseGraph::fresh(const Measurement& m, int64_t stamp_ns) const
 void PoseGraph::setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma)
 {
     if (!enu.allFinite() || !std::isfinite(sigma) || sigma > options_.gnss_max_sigma) return;
+    if (options_.alignment.enabled) {
+        if (!alignment_fixes_.empty() && stamp_ns <= alignment_fixes_.back().stamp_ns) return;
+        alignment_fixes_.push_back({stamp_ns, enu, sigma});
+        while (alignment_fixes_.size() > 512) alignment_fixes_.pop_front();
+        if (!initialized_)
+            alignment_.addFix(stamp_ns, enu, std::max(sigma, options_.gnss_sigma));
+        return;
+    }
     gnss_ = enu;
     gnss_meta_ = {stamp_ns, sigma, true};
 }
 
 void PoseGraph::setHeading(int64_t stamp_ns, double yaw_enu, double sigma)
 {
+    if (options_.alignment.enabled) return;
     if (!std::isfinite(yaw_enu) || !std::isfinite(sigma) || sigma <= 0.0) return;
     // Corrected to the epoch the measurement actually describes before it is used
     // for anything.
@@ -209,6 +218,8 @@ std::string PoseGraph::initBlockedReason(int64_t stamp_ns) const
         return s;
     };
     std::string g = describe(gnss_meta_, "GNSS fix");
+    if (options_.alignment.enabled) return g.empty() ?
+        "waiting for position alignment: need sufficient timestamp-matched motion and a consistent fit" : g;
     std::string h = describe(heading_meta_, "GNSS heading (gpsstatus/gps1/raw)");
     if (g.empty() && h.empty()) return {};
     if (g.empty()) return h;
@@ -218,6 +229,12 @@ std::string PoseGraph::initBlockedReason(int64_t stamp_ns) const
 
 bool PoseGraph::tryInitialize(int64_t stamp_ns, const Eigen::Isometry3d& odom)
 {
+    if (options_.alignment.enabled && fresh(gnss_meta_, stamp_ns)) {
+        const auto fit = alignment_.estimate();
+        if (!fit) return false;
+        heading_ = fit->yaw + yawOf(odom.rotation());
+        heading_meta_ = {stamp_ns, fit->sigma, true};
+    }
     // Anchor in ENU from the measurements. Anchoring on the odometry frame would
     // leave the graph rotated by the start heading, which no position prior undoes.
     if (!fresh(gnss_meta_, stamp_ns) || !fresh(heading_meta_, stamp_ns)) return false;
@@ -227,9 +244,17 @@ bool PoseGraph::tryInitialize(int64_t stamp_ns, const Eigen::Isometry3d& odom)
     const double yaw_correction = heading_ - yawOf(odom.rotation());
     const gtsam::Rot3 rotation =
         gtsam::Rot3::Rz(yaw_correction) * gtsam::Rot3(odom.rotation());
+    Eigen::Vector3d body_gnss = gnss_;
+    if (options_.alignment.enabled) {
+        const auto sample = alignment_.poseAt(gnss_meta_.stamp_ns);
+        if (!sample) return false;
+        const Eigen::Matrix3d world_rotation = gtsam::Rot3::Rz(yaw_correction).matrix();
+        body_gnss -= world_rotation * sample->rotation() * options_.alignment.antenna;
+        body_gnss += world_rotation * (odom.translation() - sample->translation());
+    }
     // z comes from the odometry, not the fix.
     const gtsam::Pose3 pose(
-        rotation, gtsam::Point3(gnss_.x(), gnss_.y(), odom.translation().z()));
+        rotation, gtsam::Point3(body_gnss.x(), body_gnss.y(), odom.translation().z()));
 
     values_.insert(X(next_key_), pose);
     stamps_[X(next_key_)] = static_cast<double>(stamp_ns) * 1e-9;
@@ -261,7 +286,7 @@ bool PoseGraph::tryInitialize(int64_t stamp_ns, const Eigen::Isometry3d& odom)
     gnss_meta_.valid = false;
     heading_meta_.valid = false;
     gnss_attached_ = 1;
-    heading_attached_ = 1;
+    heading_attached_ = options_.alignment.enabled ? 0 : 1;
     optimize(stamp_ns);
     return true;
 }
@@ -279,18 +304,27 @@ void PoseGraph::createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom)
 
     // Attached here, as the keyframe is built, so a node cannot be optimized before
     // its own constraints exist.
-    if (fresh(gnss_meta_, stamp_ns) &&
+    const auto gps_odom = options_.alignment.enabled ? alignment_.poseAt(gnss_meta_.stamp_ns) : std::optional<Eigen::Isometry3d>{};
+    if ((!options_.alignment.enabled || gps_odom) && fresh(gnss_meta_, stamp_ns) &&
         due(last_gnss_attached_ns_, options_.gnss_min_interval, stamp_ns))
     {
-        graph_.add(gtsam::GPSFactor(X(key), gnss_, gnssNoise(gnss_meta_.sigma)));
+        Eigen::Vector3d body_gnss = gnss_;
+        if (options_.alignment.enabled) {
+            const Eigen::Matrix3d world_rotation = world_from_odom_.rotation().matrix();
+            body_gnss -= world_rotation * gps_odom->rotation() * options_.alignment.antenna;
+            body_gnss += world_rotation * (odom.translation() - gps_odom->translation());
+        }
+        graph_.add(gtsam::GPSFactor(X(key), body_gnss, gnssNoise(gnss_meta_.sigma)));
         gnss_meta_.valid = false;
         gnss_attached_++;
         last_gnss_attached_ns_ = stamp_ns;
     }
     // Heading is queued instead: its prior is attached once samples bracketing this
     // keyframe's time exist, which is one keyframe later but on the right pose.
-    pending_kf_.push_back({key, stamp_ns});
-    attachHeadings();
+    if (!options_.alignment.enabled) {
+        pending_kf_.push_back({key, stamp_ns});
+        attachHeadings();
+    }
     addAttitudeFactor(key, odom);
     addVerticalFactor(key, odom);
 
@@ -344,6 +378,18 @@ void PoseGraph::optimize(int64_t stamp_ns)
 bool PoseGraph::addOdometry(int64_t stamp_ns, const Eigen::Isometry3d& odom)
 {
     if (!odom.matrix().allFinite()) return false;
+    if (options_.alignment.enabled) {
+        alignment_.addOdometry(stamp_ns, odom);
+        // A fix may arrive before the LIO sample bracketing its epoch. Keep it
+        // until that sample arrives instead of starving fusion on every callback.
+        while (!alignment_fixes_.empty() && alignment_fixes_.front().stamp_ns <= stamp_ns) {
+            const auto fix = alignment_fixes_.front();
+            alignment_fixes_.pop_front();
+            if (!alignment_.poseAt(fix.stamp_ns) || fix.stamp_ns <= gnss_meta_.stamp_ns) continue;
+            gnss_ = fix.enu;
+            gnss_meta_ = {fix.stamp_ns, fix.sigma, true};
+        }
+    }
 
     if (!have_odom_)
     {

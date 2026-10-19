@@ -126,3 +126,42 @@ them as measured, not as defaults to copy elsewhere without re-checking.
 Heading weight always comes from the receiver's own reported accuracy
 (`hdg_acc` on the GPSRAW message), bounded by `heading.gnss_sigma_floor` /
 `gnss_sigma_max` — there is no config knob that fixes it to a constant.
+
+
+## Initialization without heading hardware
+
+For the UGV, set `heading.initialize_from_positions: true` in `config/ugv.yaml`
+and restart. The default remains `false`. This mode ignores both dual-antenna
+heading and compass inputs, regardless of `heading.use_gnss_heading`, and requires
+LIO (`topics.odom` cannot be empty when GNSS is enabled).
+
+Before publishing globally aligned poses, GNOCCHI fits a horizontal yaw and
+translation between timestamp-matched LIO antenna positions and GNSS positions.
+LIO attitudes rotate the configured `extrinsics.gnss_antenna` offset; LIO poses
+are interpolated at GPS timestamps, without extrapolation. Reverse travel is
+supported: this estimates frame rotation, not GPS course as vehicle heading.
+Roll/pitch continue to come from gravity-aligned LIO.
+
+The initialization window defaults to 60 seconds, at least 10 fixes spaced one
+second apart, and at least 10 metres of horizontal span. Fits exceeding 1.5 m
+horizontal RMS or 20 degrees estimated angular uncertainty are rejected. Angular
+uncertainty has a 10-degree floor and does not shrink as if correlated fixes were
+independent. These are conservative heuristics, not calibrated covariance.
+See `heading.alignment` in the UGV YAML for the thresholds. LIO interpolation
+requires gaps of at most 0.5 seconds. Stationary motion, short baselines, missing
+GPS, or inconsistent fits leave initialization pending, with a throttled log.
+Move using local odometry/manual control until alignment succeeds; a controller
+that requires `odom_map` cannot initiate that motion itself.
+
+After initialization the alignment is not repeatedly applied as a heading prior.
+GPS position factors and LIO relative constraints maintain the estimate, including
+yaw correction where translational motion makes it observable. GPS outages and
+stationary periods cannot generally constrain yaw. A large GPS correction can
+still jump the global output. GNSS-only debug poses are unavailable in this mode
+because they require an independent heading. Historical map data is not repaired.
+
+Validation: `colcon build --packages-select gnocchi --cmake-args -DBUILD_TESTING=ON`
+then `colcon test --packages-select gnocchi`. The position-alignment test covers
+interpolated timing, antenna offset, reversing, stationary/bad-fit rejection,
+clock rewind during initialization, external-heading exclusion, and ongoing
+correction of synthetic yaw drift using GPS positions alone.

@@ -12,6 +12,7 @@
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
 
 #include <Eigen/Dense>
+#include "gnocchi/position_alignment.hpp"
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -22,6 +23,7 @@ namespace gnocchi
 
 struct Options
 {
+    AlignmentOptions alignment;
     // Keyframes are created on motion, not on message arrival, so a long
     // mission stays a graph the optimizer can still push a correction through.
     double keyframe_distance = 0.5;   // m
@@ -127,6 +129,9 @@ public:
     double stateSigmaFallback() const { return options_.gnss_sigma; }
 
 private:
+    PositionAlignment alignment_;
+    struct AlignmentFix { int64_t stamp_ns; Eigen::Vector3d enu; double sigma; };
+    std::deque<AlignmentFix> alignment_fixes_;
     struct Measurement
     {
         int64_t stamp_ns = 0;

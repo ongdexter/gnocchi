@@ -63,6 +63,17 @@
       fuse_altitude: false
       sigma_z: 3.0
     heading:
+      # Opt-in fallback when heading hardware/compass is unavailable. Requires
+      # motion before map output starts; ignores all external heading inputs.
+      initialize_from_positions: false
+      alignment:
+        window: 60.0          # seconds of recent data used only during initialization
+        min_samples: 10      # fixes spaced at least 1 s apart
+        min_baseline: 10.0   # metres of horizontal antenna-position span
+        max_residual: 1.5    # maximum horizontal fit RMS, metres
+        max_gap: 0.5         # maximum gap in bracketing LIO samples, seconds
+        sigma_floor_deg: 10.0
+        max_sigma_deg: 20.0
       # Dual-antenna heading error is white once it is timed correctly, so every
       # keyframe may have one.
       min_interval: 0.0

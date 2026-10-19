@@ -49,6 +49,15 @@ public:
         // supports it. Where it isn't available, fall back to the FCU's own
         // compass_hdg estimate -- worse accuracy, no per-message reported
         // sigma (it's a bare Float64), so a fixed sigma is assumed instead.
+        position_alignment_ = this->declare_parameter("heading.initialize_from_positions", false);
+        o.alignment.enabled = position_alignment_;
+        o.alignment.window = get("heading.alignment.window", 60.0);
+        o.alignment.min_baseline = get("heading.alignment.min_baseline", 10.0);
+        o.alignment.max_residual = get("heading.alignment.max_residual", 1.5);
+        o.alignment.max_gap = get("heading.alignment.max_gap", 0.5);
+        o.alignment.sigma_floor = get("heading.alignment.sigma_floor_deg", 10.0) * M_PI / 180.0;
+        o.alignment.max_sigma = get("heading.alignment.max_sigma_deg", 20.0) * M_PI / 180.0;
+        o.alignment.min_samples = this->declare_parameter("heading.alignment.min_samples", 10);
         use_gnss_heading_ = this->declare_parameter("heading.use_gnss_heading", true);
         compass_heading_sigma_ = get("heading.compass_sigma_deg", 5.0) * M_PI / 180.0;
         o.odom_attitude_sigma = get("odom.attitude_sigma", o.odom_attitude_sigma);
@@ -76,6 +85,8 @@ public:
             this->declare_parameter("extrinsics.gnss_antenna.x", 0.0),
             this->declare_parameter("extrinsics.gnss_antenna.y", 0.0),
             this->declare_parameter("extrinsics.gnss_antenna.z", 0.0));
+
+        o.alignment.antenna = lever_arm_;
 
         world_frame_ = this->declare_parameter("frames.world", std::string("world"));
         map_frame_ = this->declare_parameter("frames.map", std::string("ugv_map"));
@@ -152,6 +163,8 @@ public:
         // No odometry topic means no clock: no keyframes, no graph. The node becomes a
         // GNSS-to-local-frame converter. This is the UAV profile.
         gps_only_ = this->declare_parameter("topics.odom", std::string("odom")).empty();
+        if (position_alignment_ && gps_only_)
+            throw std::invalid_argument("heading.initialize_from_positions requires topics.odom");
         graph_ = std::make_unique<PoseGraph>(o);
         if (publish_tf_)
         {
@@ -193,7 +206,13 @@ public:
                 rel_altitude_topic, rclcpp::SensorDataQoS(),
                 std::bind(&GnocchiNode::onRelAltitude, this, std::placeholders::_1), opts);
         }
-        if (use_gnss_heading_)
+        if (position_alignment_)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                        "Heading initialized from LIO/GNSS position alignment; external heading inputs disabled. "
+                        "Move with valid GNSS to initialize; thereafter only position factors correct yaw.");
+        }
+        else if (use_gnss_heading_)
         {
             // GPS_RAW_INT carries the receiver's own yaw and its accuracy. Every instance is
             // subscribed; which one has the moving-baseline heading is wiring, not fixed.
@@ -236,7 +255,7 @@ public:
             this->declare_parameter("topics.output_pose", std::string("pose_map")), 10);
 
 
-        const char* heading_source = use_gnss_heading_
+        const char* heading_source = position_alignment_ ? "position-alignment initialization" : use_gnss_heading_
             ? "dual-antenna GNSS moving-baseline heading"
             : "FCU compass_hdg heading (fixed sigma)";
         if (gps_only_)
@@ -297,6 +316,7 @@ private:
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                      "not publishing yet: %s", why.c_str());
         }
+        const bool was_initialized = graph_->initialized();
         if (graph_->addOdometry(stamp, pose))
         {
             // If these fall behind the keyframe count the inputs are stale and
@@ -306,6 +326,9 @@ private:
                                  graph_->keyframes(), graph_->gnssAttached(),
                                  graph_->headingAttached());
         }
+        if (position_alignment_ && !was_initialized && graph_->initialized())
+            RCLCPP_INFO(this->get_logger(), "Position alignment initialized: ENU-from-odom yaw %.1f deg; no ongoing heading priors",
+                        graph_->worldFromOdom().rotation().yaw() * 180.0 / M_PI);
         publishFused(stamp);
     }
 
@@ -380,10 +403,10 @@ private:
         // single fix), so it replaces the datum-differenced z outright rather
         // than needing datum_.z() subtracted from it too.
         if (have_rel_altitude_) local.z() = rel_altitude_;
-        local -= leverArmOffset();
+        if (!position_alignment_) local -= leverArmOffset();
         graph_->setGnss(ns(msg->header.stamp), local, sigma);
         if (gps_only_) publishGpsOnly(local, sigma, msg->header.stamp);
-        if (debug_gnss_only_) publishGnssOnlyDebug(local, msg->header.stamp);
+        if (debug_gnss_only_ && !position_alignment_) publishGnssOnlyDebug(local, msg->header.stamp);
     }
 
     void onRelAltitude(const std_msgs::msg::Float64::ConstSharedPtr msg)
@@ -608,6 +631,7 @@ private:
     double rel_altitude_ = 0.0;
     std::vector<rclcpp::Subscription<mavros_msgs::msg::GPSRAW>::SharedPtr> gnss_heading_subs_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr compass_heading_sub_;
+    bool position_alignment_ = false;
     bool use_gnss_heading_ = true;
     double compass_heading_sigma_ = 5.0 * M_PI / 180.0;
     double gnss_heading_sigma_floor_ = 0.005, gnss_heading_sigma_max_ = 0.35;
