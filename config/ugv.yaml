@@ -17,7 +17,7 @@
       output_pose_throttled: pose_map_throttled
     extrinsics:
       # GNSS antenna in base_link (FLU)
-      gnss_antenna: {x: -0.15, y: -0.25, z: 0.0}
+      gnss_antenna: {x: 0.0, y: -0.25, z: 0.0}
     frames:
       # ENU / UTM, absolute.
       world: world
@@ -109,5 +109,5 @@
 
     debug:
       # Publishes the pose GNSS alone would give, to overlay in RViz.
-      publish_gnss_only: true
+      publish_gnss_only: false
       gnss_only_topic: debug/gnss_only
