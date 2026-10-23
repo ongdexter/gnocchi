@@ -181,3 +181,26 @@ or heading, stale inputs (older than five seconds), and active publishing. A sta
 heading warning explicitly notes that publication may still use the cached heading;
 this monitoring does not change that policy. Nonfinite compass headings are rejected.
 The normal `pose_map` and `odom_map` outputs are counted together, once per pair.
+
+
+## Selecting FCU compass heading
+
+Set `heading.use_gnss_heading: false` and
+`heading.initialize_from_positions: false` to use the `std_msgs/Float64` stream
+at `heading.compass_topic` (default `mavros/global_position/compass_hdg`).
+The relative topic resolves under the robot namespace. Its fixed uncertainty is
+`heading.compass_sigma_deg`, default 5 degrees. Values are interpreted as degrees
+clockwise from north and converted into ENU yaw. Nonfinite values are rejected.
+Both UGV fusion and UAV GPS-only publication support this source; GNSS heading
+subscriptions are disabled when compass is selected.
+
+For UGV fusion, `heading.time_offset` applies to the selected heading source.
+The shipped -0.240 s value was measured for GNSS heading: start with 0.0 for
+compass unless a compass-specific offset has been measured. Verify the FCU's
+north reference and magnetic calibration before interpreting global yaw.
+
+
+GNSS heading input topics are configured with `heading.gnss_topics` (a list),
+alongside `heading.compass_topic`. This replaces `topics.gnss_heading`; migrate
+that key in custom parameter files and launch overrides. `heading.use_gnss_heading`
+selects which source is subscribed.

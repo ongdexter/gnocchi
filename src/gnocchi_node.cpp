@@ -221,7 +221,7 @@ public:
             // GPS_RAW_INT carries the receiver's own yaw and its accuracy. Every instance is
             // subscribed; which one has the moving-baseline heading is wiring, not fixed.
             const auto heading_topics = this->declare_parameter<std::vector<std::string>>(
-                "topics.gnss_heading",
+                "heading.gnss_topics",
                 {"mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"});
             for (const auto& topic : heading_topics)
             {

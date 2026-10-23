@@ -10,8 +10,6 @@
     topics:
       odom: ""
       gnss: mavros/global_position/global
-      # Every GPS instance; whichever reports a valid yaw is used.
-      gnss_heading: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
       # FCU-fused (baro+GPS+IMU) altitude relative to home, in place of the raw
       # single-fix GNSS altitude for the output pose's z.
       rel_altitude: mavros/global_position/rel_alt
@@ -19,13 +17,12 @@
       output_odom_throttled: odom_map_throttled
       output_pose: pose_map
       output_pose_throttled: pose_map_throttled
-    heading:
-      # Dual-antenna moving-baseline heading needs a receiver that supports it.
-      # Set false to fall back to heading.compass_topic (mavros' compass_hdg,
-      # default mavros/global_position/compass_hdg) instead -- worse accuracy,
-      # and no per-message sigma, so heading.compass_sigma_deg (default 5.0) is
-      # assumed fixed.
-      use_gnss_heading: true
+    heading:    
+      use_gnss_heading: true # if false, compass_hdg is used instead
+      # Every GPS instance; whichever reports a valid yaw is used.
+      gnss_topics: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      compass_topic: mavros/global_position/compass_hdg
+      compass_sigma_deg: 5.0
     extrinsics:
       # GNSS antenna in base_link (FLU)
       gnss_antenna: {x: 0.0, y: -0.25, z: 0.0}
