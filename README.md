@@ -165,3 +165,19 @@ then `colcon test --packages-select gnocchi`. The position-alignment test covers
 interpolated timing, antenna offset, reversing, stationary/bad-fit rejection,
 clock rewind during initialization, external-heading exclusion, and ongoing
 correction of synthetic yaw drift using GPS positions alone.
+
+
+## UAV input and publication status
+
+GPS-only mode logs `UAV GNSS status` every five wall-clock seconds, including
+when no sensor data arrives. It reports cumulative received/valid GNSS and
+heading counts, the most recently accepted heading source, and the count of
+full-rate pose/odometry publications. Ages measure time since the last valid
+receipt or publication using a steady clock; `-1` means none yet. Counts describe
+messages accepted by the existing input checks, not independently verified accuracy.
+
+The status identifies waiting for the initialization trigger, missing valid GNSS
+or heading, stale inputs (older than five seconds), and active publishing. A stale
+heading warning explicitly notes that publication may still use the cached heading;
+this monitoring does not change that policy. Nonfinite compass headings are rejected.
+The normal `pose_map` and `odom_map` outputs are counted together, once per pair.

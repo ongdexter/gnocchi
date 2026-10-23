@@ -13,6 +13,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -166,6 +167,9 @@ public:
         if (position_alignment_ && gps_only_)
             throw std::invalid_argument("heading.initialize_from_positions requires topics.odom");
         graph_ = std::make_unique<PoseGraph>(o);
+        if (gps_only_)
+            status_timer_ = this->create_wall_timer(std::chrono::seconds(5),
+                                                  [this]() { reportGpsOnlyStatus(); });
         if (publish_tf_)
         {
             static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
@@ -354,6 +358,10 @@ private:
         pose_msg.header = msg.header;
         pose_msg.pose = msg.pose.pose;
         pose_pub_->publish(pose_msg);
+        if (gps_only_) {
+            ++poses_published_;
+            last_pose_published_ = StatusClock::now();
+        }
         // Sample fresh output at most once per second of node time. Preserve
         // the measurement stamp; never repeat stale poses when inputs stop.
         const auto now = this->now();
@@ -375,10 +383,51 @@ private:
         publish(graph_->poseFor(last_odom_pose_), t);
     }
 
+    using StatusClock = std::chrono::steady_clock;
+    using StatusTime = std::optional<StatusClock::time_point>;
+
+    void reportGpsOnlyStatus()
+    {
+        const auto now = StatusClock::now();
+        auto age = [&](const StatusTime& t) {
+            return t ? std::chrono::duration<double>(now - *t).count() : -1.0;
+        };
+        const double fix_age = age(last_valid_fix_received_);
+        const double heading_age = age(last_valid_heading_received_);
+        const double output_age = age(last_pose_published_);
+        std::string state;
+        if (!publishing_enabled_) state = "waiting for initialization trigger";
+        else if (!last_valid_fix_received_) state = "waiting for valid GNSS";
+        else if (!have_heading_) state = "waiting for valid heading";
+        else if (fix_age > 5.0) state = "GNSS input stale";
+        else if (heading_age > 5.0) state = "heading input stale (cached heading still used)";
+        else if (output_age < 0.0 || output_age > 5.0) state = "no recent pose output";
+        else state = "publishing";
+        RCLCPP_INFO(this->get_logger(),
+                    "UAV GNSS status: %s | fix rx=%llu valid=%llu age=%.1fs last=%s | "
+                    "heading rx=%llu valid=%llu age=%.1fs source=%s | poses=%llu age=%.1fs "
+                    "(receipt ages; -1 means never)",
+                    state.c_str(), static_cast<unsigned long long>(fix_received_),
+                    static_cast<unsigned long long>(fix_valid_), fix_age, last_fix_status_.c_str(),
+                    static_cast<unsigned long long>(heading_received_),
+                    static_cast<unsigned long long>(heading_valid_), heading_age, heading_source_.c_str(),
+                    static_cast<unsigned long long>(poses_published_), output_age);
+    }
+
     void onGnss(const sensor_msgs::msg::NavSatFix::ConstSharedPtr msg)
     {
-        if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX) return;
-        if (!std::isfinite(msg->latitude) || !std::isfinite(msg->longitude)) return;
+        ++fix_received_;
+        if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX) {
+            last_fix_status_ = "rejected: no fix";
+            return;
+        }
+        if (!std::isfinite(msg->latitude) || !std::isfinite(msg->longitude)) {
+            last_fix_status_ = "rejected: nonfinite position";
+            return;
+        }
+        ++fix_valid_;
+        last_valid_fix_received_ = StatusClock::now();
+        last_fix_status_ = "valid";
 
         double northing = 0.0, easting = 0.0;
         char zone[8] = {};
@@ -472,6 +521,7 @@ private:
     void onGnssHeading(const mavros_msgs::msg::GPSRAW::ConstSharedPtr msg,
                        const std::string& topic)
     {
+        ++heading_received_;
         if (msg->yaw == 0 || msg->yaw == 65535)
         {
             // Expected on the position-only receiver; only worth reporting if no
@@ -506,6 +556,9 @@ private:
                          topic.c_str(), sigma * 180.0 / M_PI, msg->fix_type);
         heading_ = std::atan2(std::sin(enu), std::cos(enu));
         have_heading_ = true;
+        ++heading_valid_;
+        last_valid_heading_received_ = StatusClock::now();
+        heading_source_ = topic;
         last_heading_sigma_ = sigma;
         gnss_heading_ns_ = ns(msg->header.stamp);
         graph_->setHeading(gnss_heading_ns_, heading_, sigma);
@@ -518,12 +571,17 @@ private:
     // fixed sigma is assumed and the node's own clock stands in for a stamp.
     void onCompassHeading(const std_msgs::msg::Float64::ConstSharedPtr msg)
     {
+        ++heading_received_;
+        if (!std::isfinite(msg->data)) return;
         const double enu = M_PI / 2.0 - msg->data * M_PI / 180.0;
         RCLCPP_INFO_ONCE(this->get_logger(),
                          "Compass heading in use (fixed sigma %.2f deg)",
                          compass_heading_sigma_ * 180.0 / M_PI);
         heading_ = std::atan2(std::sin(enu), std::cos(enu));
         have_heading_ = true;
+        ++heading_valid_;
+        last_valid_heading_received_ = StatusClock::now();
+        heading_source_ = "FCU compass_hdg";
         last_heading_sigma_ = compass_heading_sigma_;
         gnss_heading_ns_ = this->now().nanoseconds();
         graph_->setHeading(gnss_heading_ns_, heading_, compass_heading_sigma_);
@@ -631,6 +689,11 @@ private:
     double rel_altitude_ = 0.0;
     std::vector<rclcpp::Subscription<mavros_msgs::msg::GPSRAW>::SharedPtr> gnss_heading_subs_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr compass_heading_sub_;
+    rclcpp::TimerBase::SharedPtr status_timer_;
+    StatusTime last_valid_fix_received_, last_valid_heading_received_, last_pose_published_;
+    uint64_t fix_received_ = 0, fix_valid_ = 0;
+    uint64_t heading_received_ = 0, heading_valid_ = 0, poses_published_ = 0;
+    std::string last_fix_status_ = "none", heading_source_ = "none";
     bool position_alignment_ = false;
     bool use_gnss_heading_ = true;
     double compass_heading_sigma_ = 5.0 * M_PI / 180.0;
