@@ -40,6 +40,23 @@ public:
         o.odom_trans_sigma_per_m = get("odom.translation_sigma_per_m", o.odom_trans_sigma_per_m);
         o.odom_rot_sigma_per_m = get("odom.rotation_sigma_per_m", o.odom_rot_sigma_per_m);
         o.odom_rot_sigma_per_rad = get("odom.rotation_sigma_per_rad", o.odom_rot_sigma_per_rad);
+        o.gps_height.enabled = this->declare_parameter("gps_height.enabled", false);
+        o.gps_height.sigma_floor = get("gps_height.sigma_floor", 3.0);
+        gps_height_sigma_floor_ = o.gps_height.sigma_floor;
+        o.gps_height.max_reported_sigma = get("gps_height.max_reported_sigma", 2.0);
+        o.gps_height.max_speed = get("gps_height.max_speed", 2.0);
+        o.gps_height.reference_window = get("gps_height.reference_window", 30.0);
+        o.gps_height.reference_delay = get("gps_height.reference_delay", 3.0);
+        o.health.enabled = this->declare_parameter("lio_health.enabled", false);
+        o.health.max_speed = get("lio_health.max_speed", 5.0);
+        o.health.gps_max_speed = get("lio_health.gps_max_speed", 5.0);
+        o.health.disagreement = get("lio_health.disagreement", 3.0);
+        o.health.window = get("lio_health.window", 2.0);
+        o.health.confirmation = get("lio_health.confirmation", 0.5);
+        o.health.recovery = get("lio_health.recovery", 30.0);
+        o.health.degraded_rotation_sigma = get("lio_health.degraded_rotation_sigma", 0.5);
+        o.health.degraded_sigma = get("lio_health.degraded_translation_sigma", 10.0);
+        fuse_gps_altitude_ = this->declare_parameter("gnss.fuse_altitude", false);
         o.gnss_sigma = get("gnss.sigma", o.gnss_sigma);
         o.gnss_max_sigma = get("gnss.max_sigma", o.gnss_max_sigma);
         o.gnss_robust_k = get("gnss.robust_k", o.gnss_robust_k);
@@ -63,7 +80,7 @@ public:
         compass_heading_sigma_ = get("heading.compass_sigma_deg", 5.0) * M_PI / 180.0;
         o.odom_attitude_sigma = get("odom.attitude_sigma", o.odom_attitude_sigma);
         o.odom_z_sigma = get("odom.z_sigma", o.odom_z_sigma);
-        o.gnss_fuse_altitude = this->declare_parameter("gnss.fuse_altitude", false);
+        o.gnss_fuse_altitude = fuse_gps_altitude_;
         o.gnss_sigma_z = get("gnss.sigma_z", o.gnss_sigma_z);
         o.origin_z_sigma = get("origin_z_sigma", o.origin_z_sigma);
         o.max_measurement_age = get("max_measurement_age", o.max_measurement_age);
@@ -167,6 +184,7 @@ public:
         if (position_alignment_ && gps_only_)
             throw std::invalid_argument("heading.initialize_from_positions requires topics.odom");
         graph_ = std::make_unique<PoseGraph>(o);
+        degraded_pub_ = this->create_publisher<std_msgs::msg::Bool>("lio_degraded", 10);
         if (gps_only_)
             status_timer_ = this->create_wall_timer(std::chrono::seconds(5),
                                                   [this]() { reportGpsOnlyStatus(); });
@@ -333,6 +351,23 @@ private:
         if (position_alignment_ && !was_initialized && graph_->initialized())
             RCLCPP_INFO(this->get_logger(), "Position alignment initialized: ENU-from-odom yaw %.1f deg; no ongoing heading priors",
                         graph_->worldFromOdom().rotation().yaw() * 180.0 / M_PI);
+        std_msgs::msg::Bool health;
+        health.data = graph_->lioDegraded();
+        degraded_pub_->publish(health);
+        if (health.data != last_lio_degraded_) {
+            RCLCPP_WARN(this->get_logger(), "LIO health changed: %s; motion disagreement %.2f m; GPS validated=%s",
+                        health.data ? "DEGRADED (GPS-dominant recovery)" : "healthy", graph_->motionDisagreement(),
+                        graph_->gpsValidated() ? "true" : "false");
+            last_lio_degraded_ = health.data;
+        }
+        if (graph_->lioDegraded())
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                "LIO degraded; GPS validated=%s; motion disagreement %.2f m; GPS height aiding=%s (factors=%zu). Navigation pose may jump during recovery.",
+                                graph_->gpsValidated() ? "true" : "false", graph_->motionDisagreement(),
+                                graph_->gpsHeightAiding() ? "true" : "false", graph_->gpsHeightFactors());
+        if (!graph_->optimizerError().empty())
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "Optimizer failures=%zu, last error: %s", graph_->optimizerFailures(), graph_->optimizerError().c_str());
         publishFused(stamp);
     }
 
@@ -444,8 +479,9 @@ private:
             publishWorldToMap(msg->header.stamp);
         }
 
-        const double variance = std::max({msg->position_covariance[0], msg->position_covariance[4],
-                                          msg->position_covariance[8]});
+        const double variance = (fuse_gps_altitude_ || gps_only_)
+            ? std::max({msg->position_covariance[0], msg->position_covariance[4], msg->position_covariance[8]})
+            : std::max(msg->position_covariance[0], msg->position_covariance[4]);
         const double sigma = std::isfinite(variance) && variance > 1e-9 ? std::sqrt(variance) : 0.0;
         Eigen::Vector3d local = Eigen::Vector3d(easting, northing, msg->altitude) - datum_;
         // rel_altitude is already relative to home (and FCU-fused, not a raw
@@ -453,7 +489,11 @@ private:
         // than needing datum_.z() subtracted from it too.
         if (have_rel_altitude_) local.z() = rel_altitude_;
         if (!position_alignment_) local -= leverArmOffset();
-        graph_->setGnss(ns(msg->header.stamp), local, sigma);
+        const double vertical_variance = msg->position_covariance[8];
+        const double vertical_sigma = msg->position_covariance_type != sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN &&
+                                      std::isfinite(vertical_variance) && vertical_variance > 0
+            ? std::sqrt(vertical_variance) : 0.0;
+        graph_->setGnss(ns(msg->header.stamp), local, sigma, vertical_sigma);
         if (gps_only_) publishGpsOnly(local, sigma, msg->header.stamp);
         if (debug_gnss_only_ && !position_alignment_) publishGnssOnlyDebug(local, msg->header.stamp);
     }
@@ -633,6 +673,15 @@ private:
         A.block<3, 3>(0, 0) = map_from_local_.matrix();
         A.block<3, 3>(3, 3) = map_from_local_.matrix();
         Eigen::Matrix<double, 6, 6> Craw = graph_->state().covariance;
+        if (!gps_only_ && graph_->lioDegraded()) {
+            // Health allowance, not a calibrated posterior under sensor failure.
+            for (int i = 0; i < 3; ++i) {
+                Craw(i, i) = std::max(Craw(i, i), 0.25);
+                Craw(i + 3, i + 3) = std::max(Craw(i + 3, i + 3), graph_->gpsValidated() ? 1.0 : 25.0);
+            }
+        }
+        if (!gps_only_ && graph_->gpsHeightAiding())
+            Craw(5, 5) = std::max(Craw(5, 5), gps_height_sigma_floor_ * gps_height_sigma_floor_);
         if (gps_only_)
         {
             Craw.setZero();
@@ -694,6 +743,9 @@ private:
     uint64_t fix_received_ = 0, fix_valid_ = 0;
     uint64_t heading_received_ = 0, heading_valid_ = 0, poses_published_ = 0;
     std::string last_fix_status_ = "none", heading_source_ = "none";
+    double gps_height_sigma_floor_ = 3.0;
+    bool fuse_gps_altitude_ = false, last_lio_degraded_ = false;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr degraded_pub_;
     bool position_alignment_ = false;
     bool use_gnss_heading_ = true;
     double compass_heading_sigma_ = 5.0 * M_PI / 180.0;

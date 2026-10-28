@@ -15,7 +15,7 @@ using gtsam::symbol_shorthand::X;
 namespace gnocchi
 {
 
-PoseGraph::PoseGraph(const Options& options) : alignment_(options.alignment), options_(options)
+PoseGraph::PoseGraph(const Options& options) : gps_height_(options.gps_height), health_(options.health), alignment_(options.alignment), options_(options)
 {
     gtsam::ISAM2Params params;
     params.setRelinearizeThreshold(0.1);
@@ -32,17 +32,19 @@ bool PoseGraph::fresh(const Measurement& m, int64_t stamp_ns) const
     return age <= options_.max_measurement_age;
 }
 
-void PoseGraph::setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma)
+void PoseGraph::setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma, double vertical_sigma)
 {
     if (!enu.allFinite() || !std::isfinite(sigma) || sigma > options_.gnss_max_sigma) return;
+    health_.fix(stamp_ns, enu);
     if (options_.alignment.enabled) {
         if (!alignment_fixes_.empty() && stamp_ns <= alignment_fixes_.back().stamp_ns) return;
-        alignment_fixes_.push_back({stamp_ns, enu, sigma});
+        alignment_fixes_.push_back({stamp_ns, enu, sigma, vertical_sigma});
         while (alignment_fixes_.size() > 512) alignment_fixes_.pop_front();
         if (!initialized_)
             alignment_.addFix(stamp_ns, enu, std::max(sigma, options_.gnss_sigma));
         return;
     }
+    gnss_vertical_sigma_ = vertical_sigma;
     gnss_ = enu;
     gnss_meta_ = {stamp_ns, sigma, true};
 }
@@ -131,7 +133,7 @@ void PoseGraph::attachHeadings()
 
 void PoseGraph::addAttitudeFactor(size_t key, const Eigen::Isometry3d& odom)
 {
-    if (options_.odom_attitude_sigma <= 0.0) return;
+    if (options_.odom_attitude_sigma <= 0.0 || health_.everDegraded()) return;
     // Gravity-direction factor: genuinely 2-DOF and yaw invariant, so it cannot
     // fight the heading prior.
     //
@@ -160,7 +162,7 @@ double zOfPoint(const gtsam::Point3& p, gtsam::OptionalJacobian<1, 3> H)
 
 void PoseGraph::addVerticalFactor(size_t key, const Eigen::Isometry3d& odom)
 {
-    if (options_.odom_z_sigma <= 0.0) return;
+    if (options_.odom_z_sigma <= 0.0 || health_.everDegraded()) return;
     // Vertical only, and genuinely 1-DOF. A 3-DOF factor with a large but finite
     // horizontal sigma is not the same as no horizontal constraint: every keyframe
     // then pulls weakly towards x=y=0, and over hundreds of them that sums to an
@@ -185,7 +187,7 @@ gtsam::SharedNoiseModel PoseGraph::gnssNoise(double sigma) const
     const double sz = options_.gnss_fuse_altitude ? options_.gnss_sigma_z : 1e3;
     gtsam::SharedNoiseModel base =
         gtsam::noiseModel::Diagonal::Sigmas(gtsam::Vector3(s, s, sz));
-    if (options_.gnss_robust_k <= 0.0) return base;
+    if (options_.gnss_robust_k <= 0.0 || (health_.degraded() && health_.reliableGps())) return base;
     // A bad fix bends the trajectory rather than yanking it.
     return gtsam::noiseModel::Robust::Create(
         gtsam::noiseModel::mEstimator::Huber::Create(options_.gnss_robust_k), base);
@@ -195,8 +197,8 @@ gtsam::SharedNoiseModel PoseGraph::betweenNoise(const Eigen::Isometry3d& delta) 
 {
     const double distance = delta.translation().norm();
     const double angle = Eigen::AngleAxisd(delta.rotation()).angle();
-    const double t = std::max(options_.odom_trans_floor, options_.odom_trans_sigma_per_m * distance);
-    const double r = std::max(options_.odom_rot_floor,
+    const double t = std::max(health_.degraded() ? options_.health.degraded_sigma : options_.odom_trans_floor, options_.odom_trans_sigma_per_m * distance);
+    const double r = std::max(health_.degraded() ? options_.health.degraded_rotation_sigma : options_.odom_rot_floor,
                               options_.odom_rot_sigma_per_m * distance +
                                   options_.odom_rot_sigma_per_rad * angle);
     return gtsam::noiseModel::Diagonal::Sigmas(
@@ -306,7 +308,7 @@ void PoseGraph::createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom)
     // its own constraints exist.
     const auto gps_odom = options_.alignment.enabled ? alignment_.poseAt(gnss_meta_.stamp_ns) : std::optional<Eigen::Isometry3d>{};
     if ((!options_.alignment.enabled || gps_odom) && fresh(gnss_meta_, stamp_ns) &&
-        due(last_gnss_attached_ns_, options_.gnss_min_interval, stamp_ns))
+        due(last_gnss_attached_ns_, health_.degraded() && health_.reliableGps() ? 0.1 : options_.gnss_min_interval, stamp_ns))
     {
         Eigen::Vector3d body_gnss = gnss_;
         if (options_.alignment.enabled) {
@@ -324,6 +326,19 @@ void PoseGraph::createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom)
     if (!options_.alignment.enabled) {
         pending_kf_.push_back({key, stamp_ns});
         attachHeadings();
+    }
+    if (health_.everDegraded() && health_.reliableGps() && !options_.gnss_fuse_altitude) {
+        const auto height = gps_height_.measurement(stamp_ns);
+        if (height) {
+            // Separate vertical factor: a bad height must not attenuate horizontal GPS.
+            auto noise = gtsam::noiseModel::Robust::Create(
+                gtsam::noiseModel::mEstimator::Huber::Create(1.345),
+                gtsam::noiseModel::Isotropic::Sigma(1, height->sigma));
+            graph_.addExpressionFactor(
+                gtsam::Double_(&zOfPoint, gtsam::translation(gtsam::Pose3_(X(key)))), height->z, noise);
+            ++gps_height_factors_;
+            last_height_factor_ns_ = stamp_ns;
+        }
     }
     addAttitudeFactor(key, odom);
     addVerticalFactor(key, odom);
@@ -361,14 +376,17 @@ void PoseGraph::optimize(int64_t stamp_ns)
         state_.stamp_ns = stamp_ns;
         state_.keyframes = keyframes_;
         state_.valid = true;
+        optimizer_error_.clear();
         // Promote the correction together with the state it belongs to, so a
         // reader can never pair a new anchor with an older pose.
         world_from_odom_ = state_.pose * gtsam::Pose3(keyframe_odom_.matrix()).inverse();
     }
-    catch (const std::exception&)
+    catch (const std::exception& error)
     {
+        ++optimizer_failures_;
+        optimizer_error_ = error.what();
         // Keep the previous state; the next keyframe retries.
-        state_.valid = keyframes_ > 1;
+        state_.valid = false;
     }
     graph_.resize(0);
     values_.clear();
@@ -386,9 +404,29 @@ bool PoseGraph::addOdometry(int64_t stamp_ns, const Eigen::Isometry3d& odom)
             const auto fix = alignment_fixes_.front();
             alignment_fixes_.pop_front();
             if (!alignment_.poseAt(fix.stamp_ns) || fix.stamp_ns <= gnss_meta_.stamp_ns) continue;
+            gnss_vertical_sigma_ = fix.vertical_sigma;
             gnss_ = fix.enu;
             gnss_meta_ = {fix.stamp_ns, fix.sigma, true};
         }
+    }
+
+    if (initialized_) {
+        Eigen::Isometry3d health_pose = odom;
+        if (options_.alignment.enabled) health_pose.translation() = odom * options_.alignment.antenna;
+        health_.odom(stamp_ns, health_pose, world_from_odom_.rotation().matrix());
+    }
+
+    if (initialized_ && fresh(gnss_meta_, stamp_ns)) {
+        // Node input is body position (including antenna compensation). Delay the
+        // reference median so the onset of a failure cannot immediately redefine it.
+        double height = gnss_.z();
+        if (options_.alignment.enabled) {
+            const auto sample = alignment_.poseAt(gnss_meta_.stamp_ns);
+            if (sample)
+                height -= (world_from_odom_.rotation().matrix() * sample->rotation() * options_.alignment.antenna).z();
+        }
+        gps_height_.observe(gnss_meta_.stamp_ns, height, gnss_vertical_sigma_,
+                            poseFor(odom).z(), health_.everDegraded());
     }
 
     if (!have_odom_)

@@ -13,6 +13,8 @@
 
 #include <Eigen/Dense>
 #include "gnocchi/position_alignment.hpp"
+#include "gnocchi/lio_health.hpp"
+#include "gnocchi/gps_height.hpp"
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -24,6 +26,8 @@ namespace gnocchi
 struct Options
 {
     AlignmentOptions alignment;
+    LioHealthOptions health;
+    GpsHeightOptions gps_height;
     // Keyframes are created on motion, not on message arrival, so a long
     // mission stays a graph the optimizer can still push a correction through.
     double keyframe_distance = 0.5;   // m
@@ -104,16 +108,23 @@ public:
 
     // Cache the newest measurements. These never touch the graph; they are
     // consumed when the next keyframe is created.
-    void setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma);
+    void setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma, double vertical_sigma = 0.0);
     void setHeading(int64_t stamp_ns, double yaw_enu, double sigma);
 
     // The clock. Returns true when this reading created a keyframe.
     bool addOdometry(int64_t stamp_ns, const Eigen::Isometry3d& odom);
 
+    size_t gpsHeightFactors() const { return gps_height_factors_; }
+    bool gpsHeightAiding() const { return last_height_factor_ns_ && state_.stamp_ns >= last_height_factor_ns_ && (state_.stamp_ns-last_height_factor_ns_)*1e-9 <= 0.5; }
+    bool lioDegraded() const { return health_.degraded(); }
+    bool gpsValidated() const { return health_.reliableGps(); }
+    double motionDisagreement() const { return health_.discrepancy(); }
+    size_t optimizerFailures() const { return optimizer_failures_; }
+    const std::string& optimizerError() const { return optimizer_error_; }
     bool initialized() const { return initialized_; }
     // Why initialisation has not happened yet, for logging. Empty once running.
     std::string initBlockedReason(int64_t stamp_ns) const;
-    bool publishable() const { return initialized_ && keyframes_ >= options_.min_keyframes; }
+    bool publishable() const { return initialized_ && state_.valid && keyframes_ >= options_.min_keyframes; }
     const State& state() const { return state_; }
     // How many keyframes actually received each measurement. If these lag the
     // keyframe count, the inputs are stale or the age limit is too tight.
@@ -129,8 +140,15 @@ public:
     double stateSigmaFallback() const { return options_.gnss_sigma; }
 
 private:
+    GpsHeight gps_height_;
+    size_t gps_height_factors_ = 0;
+    int64_t last_height_factor_ns_ = 0;
+    double gnss_vertical_sigma_ = 0.0;
+    LioHealth health_;
+    size_t optimizer_failures_ = 0;
+    std::string optimizer_error_;
     PositionAlignment alignment_;
-    struct AlignmentFix { int64_t stamp_ns; Eigen::Vector3d enu; double sigma; };
+    struct AlignmentFix { int64_t stamp_ns; Eigen::Vector3d enu; double sigma; double vertical_sigma; };
     std::deque<AlignmentFix> alignment_fixes_;
     struct Measurement
     {

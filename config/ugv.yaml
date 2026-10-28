@@ -47,6 +47,26 @@
       attitude_sigma: 0.05
       # Gravity-aligned odometry holds z; GNSS altitude is not fused.
       z_sigma: 0.1
+    # Incremental LIO/GPS consistency checks; thresholds assume a slow UGV.
+    # Degraded mode may apply abrupt global corrections. See README limitations.
+    lio_health:
+      enabled: true
+      max_speed: 5.0
+      gps_max_speed: 5.0
+      disagreement: 3.0
+      window: 2.0
+      confirmation: 0.5
+      recovery: 30.0
+      degraded_translation_sigma: 10.0
+      degraded_rotation_sigma: 0.5
+    # Weak relative GPS height after LIO failure; healthy operation is unchanged.
+    gps_height:
+      enabled: true
+      sigma_floor: 3.0
+      max_reported_sigma: 2.0
+      max_speed: 2.0
+      reference_window: 30.0
+      reference_delay: 3.0
     gnss:
       # One-second minimum between position factors improves drift tracking and
       # GPS recovery in bag tests; factors attach at eligible keyframes.
