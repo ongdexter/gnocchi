@@ -327,8 +327,11 @@ void PoseGraph::createKeyframe(int64_t stamp_ns, const Eigen::Isometry3d& odom)
         pending_kf_.push_back({key, stamp_ns});
         attachHeadings();
     }
-    if (health_.everDegraded() && health_.reliableGps() && !options_.gnss_fuse_altitude) {
-        const auto height = gps_height_.measurement(stamp_ns);
+    {
+        const bool height_eligible = health_.everDegraded() && health_.reliableGps() &&
+                                     !options_.gnss_fuse_altitude;
+        const auto height = gps_height_.rampedMeasurement(
+            stamp_ns, (state_.pose * delta).z(), height_eligible);
         if (height) {
             // Separate vertical factor: a bad height must not attenuate horizontal GPS.
             auto noise = gtsam::noiseModel::Robust::Create(
@@ -428,6 +431,11 @@ bool PoseGraph::addOdometry(int64_t stamp_ns, const Eigen::Isometry3d& odom)
         gps_height_.observe(gnss_meta_.stamp_ns, height, gnss_vertical_sigma_,
                             poseFor(odom).z(), health_.everDegraded());
     }
+    // Observe loss of aiding at odometry rate, even when a stationary robot
+    // creates no keyframes. Reacquisition must start a fresh height transition.
+    gps_height_.suspendIfUnavailable(
+        stamp_ns, initialized_ && health_.everDegraded() && health_.reliableGps() &&
+                      !options_.gnss_fuse_altitude);
 
     if (!have_odom_)
     {

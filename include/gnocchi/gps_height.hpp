@@ -16,6 +16,9 @@ struct GpsHeightOptions {
   double reference_window = 30.0;
   double reference_delay =
       3.0; // exclude the LIO failure's confirmation interval
+  // Fade the initial GPS/estimate height mismatch over this many seconds.
+  // Zero retains immediate height recovery. This is not an output rate limit.
+  double recovery_ramp_time = 5.0;
 };
 class GpsHeight {
 public:
@@ -31,6 +34,9 @@ public:
     if (o.reference_window <= o.reference_delay)
       throw std::invalid_argument(
           "gps_height reference window must exceed delay");
+    if (!std::isfinite(o.recovery_ramp_time) || o.recovery_ramp_time < 0)
+      throw std::invalid_argument(
+          "gps_height recovery ramp time must be finite and nonnegative");
   }
   void observe(int64_t t, double z, double sigma, double healthy_pose_z,
                bool failed) {
@@ -51,6 +57,7 @@ public:
     if (!std::isfinite(z) || !std::isfinite(sigma) || sigma <= 0 ||
         sigma > o_.max_reported_sigma) {
       stable_.clear();
+      resetRecovery();
       return;
     }
     if (!stable_.empty()) {
@@ -58,8 +65,10 @@ public:
       double dt = (t - last.t) * 1e-9;
       if (dt <= 0 || dt < .15)
         return;
-      if (dt > 1 || std::abs(z - last.z) > o_.max_speed * dt)
+      if (dt > 1 || std::abs(z - last.z) > o_.max_speed * dt) {
         stable_.clear();
+        resetRecovery();
+      }
     }
     stable_.push_back({t, z, sigma});
     while (stable_.size() > 1 && (t - stable_[1].t) * 1e-9 > 1.0)
@@ -81,7 +90,37 @@ public:
                        std::max(o_.sigma_floor, stable_.back().sigma)};
   }
 
+  // Only bridge the activation mismatch. Following GPS height changes after
+  // activation still provides a vertical anchor when LIO increments are bad.
+  // Re-anchor after aiding becomes unavailable, rather than applying a stale
+  // ramp across a GPS outage. Call for every keyframe, including ineligible ones.
+  void suspendIfUnavailable(int64_t now, bool eligible) {
+    if (!eligible || !measurement(now))
+      resetRecovery();
+  }
+
+  std::optional<Measurement> rampedMeasurement(int64_t now,
+                                             double predicted_pose_z,
+                                             bool eligible) {
+    const auto raw = measurement(now);
+    if (!eligible || !raw || !std::isfinite(predicted_pose_z)) {
+      resetRecovery();
+      return {};
+    }
+    if (o_.recovery_ramp_time == 0)
+      return raw;
+    if (!ramp_start_ns_) {
+      ramp_start_ns_ = now;
+      ramp_offset_ = predicted_pose_z - raw->z;
+    }
+    const double elapsed = std::max(0.0, (now - ramp_start_ns_) * 1e-9);
+    const double remaining =
+        std::max(0.0, 1.0 - elapsed / o_.recovery_ramp_time);
+    return Measurement{raw->z + remaining * ramp_offset_, raw->sigma};
+  }
+
 private:
+  void resetRecovery() { ramp_start_ns_ = 0; }
   struct Sample {
     int64_t t;
     double z, sigma;
@@ -96,5 +135,7 @@ private:
   int64_t last_seen_ = 0;
   bool frozen_ = false;
   double offset_ = 0;
+  int64_t ramp_start_ns_ = 0;
+  double ramp_offset_ = 0;
 };
 } // namespace gnocchi

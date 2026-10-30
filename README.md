@@ -276,6 +276,17 @@ under `gps_height`. This is relative height recovery, not accurate absolute
 ellipsoid or terrain elevation. Persistent GPS altitude bias changes remain a
 limitation. With insufficient healthy reference data, aiding stays unavailable.
 
+`gps_height.recovery_ramp_time` (default 5 seconds, 0 for the previous immediate
+correction) gradually removes the height mismatch when aiding first becomes
+available. The first target matches the graph's predicted height; its temporary
+offset from the GPS target fades linearly to zero. After that, the original GPS
+height target and covariance apply unchanged. GPS altitude changes and actual
+robot motion are not low-pass filtered or velocity-clamped. If aiding becomes
+unavailable, the transition restarts from the current prediction
+when valid aiding returns. Horizontal GPS factors and recovery gates are unchanged.
+This reduces the activation discontinuity; it is not a hard bound on every
+published pose step, and does not retroactively reproject stored map points.
+
 Height aiding remains available after the horizontal LIO health flag recovers,
 because the failed absolute LIO height prior remains disabled until restart.
 It does not run if full `gnss.fuse_altitude` is explicitly enabled. The separate

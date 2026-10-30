@@ -67,6 +67,7 @@
       max_speed: 2.0
       reference_window: 30.0
       reference_delay: 3.0
+      recovery_ramp_time: 5.0 # seconds to fade the activation mismatch; 0 restores immediate correction
     gnss:
       # One-second minimum between position factors improves drift tracking and
       # GPS recovery in bag tests; factors attach at eligible keyframes.

@@ -47,6 +47,7 @@ public:
         o.gps_height.max_speed = get("gps_height.max_speed", 2.0);
         o.gps_height.reference_window = get("gps_height.reference_window", 30.0);
         o.gps_height.reference_delay = get("gps_height.reference_delay", 3.0);
+        o.gps_height.recovery_ramp_time = get("gps_height.recovery_ramp_time", 5.0);
         o.health.enabled = this->declare_parameter("lio_health.enabled", false);
         o.health.max_speed = get("lio_health.max_speed", 5.0);
         o.health.gps_max_speed = get("lio_health.gps_max_speed", 5.0);
