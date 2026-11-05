@@ -1,11 +1,13 @@
 #include "gnocchi/pose_graph.hpp"
 #include "gnocchi/utm.hpp"
+#include "gnocchi/yaw_filter.hpp"
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <mavros_msgs/msg/gpsraw.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
@@ -15,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -94,6 +97,26 @@ public:
         o.use_fixed_lag = this->declare_parameter("optimizer.fixed_lag", false);
         o.lag_time = get("optimizer.lag_time", o.lag_time);
         o.min_keyframes = static_cast<size_t>(this->declare_parameter("optimizer.min_keyframes", 5));
+        options_ = o;
+
+        // GNSS-only fallback while lidar odometry is missing (see README).
+        fallback_enabled_ = this->declare_parameter("fallback.enabled", false);
+        odom_timeout_ = get("fallback.odom_timeout", 0.5);
+        startup_wait_ = get("fallback.startup_wait", 10.0);
+        odom_jump_ = get("fallback.odom_jump", 2.0);
+        rebuild_after_ = get("fallback.rebuild_after", 2.0);
+        on_lio_degraded_ = this->declare_parameter("fallback.on_lio_degraded", false);
+        blend_time_ = get("fallback.blend_time", 10.0);
+        max_heading_age_ = get("fallback.max_heading_age", 30.0);
+        altitude_tau_ = get("fallback.altitude_tau", 5.0);
+        fallback_z_sigma_ = get("fallback.z_sigma", 1.0);
+        fallback_tilt_sigma_ = get("fallback.tilt_sigma_deg", 3.0) * M_PI / 180.0;
+        fused_yaw_sigma_floor_ = get("fallback.fused_yaw_sigma_floor_deg", 0.5) * M_PI / 180.0;
+        YawFilterOptions yo;
+        yo.gyro_noise = get("fallback.gyro_noise", yo.gyro_noise);
+        yo.bias_random_walk = get("fallback.gyro_bias_random_walk", yo.bias_random_walk);
+        yo.max_bias = get("fallback.gyro_max_bias_deg", 2.0) * M_PI / 180.0;
+        yaw_filter_ = YawFilter(yo);
 
 
         // GNSS antenna in body frame (FLU). The fix reports the antenna, the estimate
@@ -214,6 +237,21 @@ public:
                 this->get_parameter("topics.odom").as_string(), rclcpp::SensorDataQoS(),
                 std::bind(&GnocchiNode::onOdom, this, std::placeholders::_1), opts);
         }
+        const auto imu_topic = this->declare_parameter("fallback.imu_topic", std::string(""));
+        if (fallback_enabled_ && !gps_only_)
+        {
+            if (!imu_topic.empty())
+                imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+                    imu_topic, rclcpp::SensorDataQoS(),
+                    std::bind(&GnocchiNode::onImu, this, std::placeholders::_1), opts);
+            watchdog_ = rclcpp::create_timer(this, this->get_clock(), std::chrono::milliseconds(50),
+                                             [this]() { checkOdometry(); }, sensor_group_);
+            RCLCPP_INFO(this->get_logger(),
+                        "GNSS-only fallback armed: after %.1f s without odometry, publish GNSS position "
+                        "with %s yaw (gyro bridges heading gaps up to %.0f s)",
+                        odom_timeout_, imu_topic.empty() ? "dual-antenna/compass" : "gyro-propagated",
+                        imu_topic.empty() ? 0.0 : max_heading_age_);
+        }
         gnss_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
             this->declare_parameter("topics.gnss", std::string("fix")),
             rclcpp::SensorDataQoS(),
@@ -328,6 +366,43 @@ private:
         if (!pose.matrix().allFinite()) return;
 
         const int64_t stamp = ns(msg->header.stamp);
+        if (fallback_enabled_)
+        {
+            const rclcpp::Time now = this->now();
+            // A restarted odometry source begins again at its own origin. If it came
+            // back before the watchdog noticed, the jump gives it away.
+            if (!in_fallback_ && have_odom_pose_)
+            {
+                const double jump = (pose.translation() - last_odom_pose_.translation()).norm();
+                const double dt = std::abs(static_cast<double>(stamp - last_odom_ns_)) * 1e-9;
+                if (jump > odom_jump_ && jump > 5.0 * dt)
+                    enterFallback("odometry jumped " + std::to_string(jump) + " m");
+            }
+            if (in_fallback_ && !graph_rebuilt_ && !degraded_fallback_ && have_odom_pose_ &&
+                static_cast<double>(stamp - last_odom_ns_) * 1e-9 <= rebuild_after_ &&
+                (pose.translation() - last_odom_pose_.translation()).norm() <= odom_jump_)
+            {
+                // A short stall of the same source: its frame is unchanged, so the
+                // existing chain simply continues.
+                in_fallback_ = false;
+                RCLCPP_WARN(this->get_logger(), "Odometry resumed after %.2f s in the same frame; fused output resumed",
+                            static_cast<double>(stamp - last_odom_ns_) * 1e-9);
+            }
+            if (in_fallback_ && !graph_rebuilt_)
+            {
+                // Odometry is back, possibly in a new frame: the old chain cannot be
+                // continued, so start a new graph at the current height.
+                graph_ = std::make_unique<PoseGraph>(options_);
+                if (have_fallback_z_) graph_->setInitialZ(fallback_z_);
+                graph_rebuilt_ = true;
+                have_odom_pose_ = false;
+                RCLCPP_WARN(this->get_logger(),
+                            "Odometry resumed; rebuilding the pose graph (GNSS-only output continues "
+                            "until it has %zu keyframes)", options_.min_keyframes);
+            }
+            last_odom_rx_ = now;
+            have_odom_rx_ = true;
+        }
         last_odom_pose_ = pose;
         last_odom_ns_ = stamp;
         have_odom_pose_ = true;
@@ -352,6 +427,31 @@ private:
         if (position_alignment_ && !was_initialized && graph_->initialized())
             RCLCPP_INFO(this->get_logger(), "Position alignment initialized: ENU-from-odom yaw %.1f deg; no ongoing heading priors",
                         graph_->worldFromOdom().rotation().yaw() * 180.0 / M_PI);
+        if (in_fallback_)
+        {
+            if (!graph_->publishable()) return;
+            exitFallback();
+        }
+        // Optionally ride out a detected LIO fault on GNSS too: the faded entry
+        // replaces the graph's abrupt GPS-dominant correction.
+        if (fallback_enabled_ && on_lio_degraded_ && graph_->publishable())
+        {
+            const bool degraded = graph_->lioDegraded();
+            if (degraded && !degraded_fallback_)
+            {
+                degraded_fallback_ = true;
+                fused_healthy_ = false;
+                fallback_entry_pending_ = true;
+                RCLCPP_ERROR(this->get_logger(), "LIO degraded: publishing GNSS-only pose until it recovers");
+            }
+            else if (!degraded && degraded_fallback_)
+            {
+                degraded_fallback_ = false;
+                RCLCPP_WARN(this->get_logger(), "LIO recovered: fused output resumed after %zu GNSS-only poses",
+                            fallback_poses_);
+                fallback_poses_ = 0;
+            }
+        }
         std_msgs::msg::Bool health;
         health.data = graph_->lioDegraded();
         degraded_pub_->publish(health);
@@ -369,6 +469,7 @@ private:
         if (!graph_->optimizerError().empty())
             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                  "Optimizer failures=%zu, last error: %s", graph_->optimizerFailures(), graph_->optimizerError().c_str());
+        if (degraded_fallback_) return;
         publishFused(stamp);
     }
 
@@ -416,7 +517,166 @@ private:
         builtin_interfaces::msg::Time t;
         t.sec = static_cast<int32_t>(stamp_ns / 1000000000LL);
         t.nanosec = static_cast<uint32_t>(stamp_ns % 1000000000LL);
-        publish(graph_->poseFor(last_odom_pose_), t);
+        const gtsam::Pose3 pose = graph_->poseFor(last_odom_pose_);
+        publish(pose, t);
+        if (!fallback_enabled_) return;
+        last_fused_ = pose;
+        last_fused_ns_ = stamp_ns;
+        // While the graph is healthy its yaw is the best there is: it keeps the
+        // fallback's yaw and gyro bias current through dual-antenna gaps too.
+        fused_healthy_ = !graph_->lioDegraded();
+        if (fused_healthy_)
+            yaw_filter_.measure(stamp_ns, pose.rotation().yaw(),
+                                std::max(std::sqrt(std::max(graph_->state().covariance(2, 2), 0.0)),
+                                         fused_yaw_sigma_floor_));
+    }
+
+    // ---- GNSS-only fallback -------------------------------------------------
+
+    void onImu(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
+    {
+        yaw_filter_.gyro(ns(msg->header.stamp), msg->angular_velocity.z);
+    }
+
+    // Feeds the yaw filter from the raw heading whenever the graph is not
+    // already supplying a better yaw.
+    void headingToFilter(int64_t stamp_ns, double yaw, double sigma)
+    {
+        if (!fallback_enabled_ || fused_healthy_) return;
+        yaw_filter_.measure(stamp_ns, yaw, sigma);
+    }
+
+    void checkOdometry()
+    {
+        if (in_fallback_ || !datum_set_ || !have_first_fix_rx_) return;
+        const rclcpp::Time now = this->now();
+        if (have_odom_rx_)
+        {
+            const double age = (now - last_odom_rx_).seconds();
+            if (age > odom_timeout_ && last_fused_ns_)
+                enterFallback("no odometry for " + std::to_string(age).substr(0, 4) + " s");
+            return;
+        }
+        // Never had odometry: after a grace period, GNSS alone beats no pose at all.
+        if ((now - first_fix_rx_).seconds() > startup_wait_)
+            enterFallback("no odometry since startup");
+    }
+
+    void enterFallback(const std::string& why)
+    {
+        in_fallback_ = true;
+        graph_rebuilt_ = false;
+        fused_healthy_ = false;
+        // Already on GNSS (degraded LIO): keep the running output, no new entry step.
+        if (!degraded_fallback_) fallback_entry_pending_ = true;
+        degraded_fallback_ = false;
+        RCLCPP_ERROR(this->get_logger(),
+                     "LIDAR ODOMETRY LOST (%s): publishing GNSS-only pose; roll/pitch level, yaw %s. "
+                     "Local accuracy is GNSS accuracy (~0.5 m).",
+                     why.c_str(), imu_sub_ ? "from heading + gyro" : "from heading only");
+    }
+
+    void exitFallback()
+    {
+        in_fallback_ = false;
+        RCLCPP_WARN(this->get_logger(),
+                    "Rebuilt pose graph is publishable; fused lidar/GNSS output resumed after %zu GNSS-only poses",
+                    fallback_poses_);
+        fallback_poses_ = 0;
+    }
+
+    // Body position the fix implies with the filter's yaw, for every fix, so the
+    // fallback can line up with the last fused pose when it starts.
+    void recordRaw(int64_t stamp_ns, const Eigen::Vector3d& antenna)
+    {
+        if (!yaw_filter_.initialized()) return;
+        Eigen::Vector3d body = antenna;
+        if (!lever_arm_.isZero())
+            body -= gtsam::Rot3::Rz(yaw_filter_.yawAt(stamp_ns)).matrix() * lever_arm_;
+        raw_.push_back({stamp_ns, body});
+        while (raw_.size() > 2 && static_cast<double>(stamp_ns - raw_.front().stamp_ns) * 1e-9 > 5.0)
+            raw_.pop_front();
+    }
+
+    std::optional<Eigen::Vector3d> rawAt(int64_t stamp_ns) const
+    {
+        if (raw_.empty()) return std::nullopt;
+        if (stamp_ns <= raw_.front().stamp_ns) return raw_.front().body;
+        for (size_t i = 1; i < raw_.size(); ++i)
+            if (raw_[i].stamp_ns >= stamp_ns)
+            {
+                const double w = static_cast<double>(stamp_ns - raw_[i - 1].stamp_ns) /
+                                 static_cast<double>(raw_[i].stamp_ns - raw_[i - 1].stamp_ns);
+                return raw_[i - 1].body + w * (raw_[i].body - raw_[i - 1].body);
+            }
+        return raw_.back().body;
+    }
+
+    void publishFallback(int64_t stamp_ns, const builtin_interfaces::msg::Time& stamp, double sigma)
+    {
+        if (!yaw_filter_.valid(stamp_ns, max_heading_age_))
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                  "GNSS-only fallback has no usable yaw (last heading %.1f s ago); "
+                                  "not publishing", yaw_filter_.measurementAge(stamp_ns));
+            return;
+        }
+        const Eigen::Vector3d raw = raw_.back().body;
+        if (fallback_entry_pending_)
+        {
+            // Start where the fused estimate left off and fade the difference out,
+            // rather than stepping to GNSS.
+            fallback_entry_pending_ = false;
+            fallback_entry_ns_ = stamp_ns;
+            const auto at_fused = last_fused_ns_ ? rawAt(last_fused_ns_) : std::nullopt;
+            if (at_fused)
+            {
+                entry_offset_ = last_fused_.translation() - *at_fused;
+                entry_offset_.z() = 0.0;
+                z_entry_ = last_fused_.z();
+                alt_ref_ = at_fused->z();
+            }
+            else
+            {
+                entry_offset_.setZero();
+                z_entry_ = have_fallback_z_ ? fallback_z_ : raw.z();
+                alt_ref_ = raw.z();
+            }
+            alt_lp_ = 0.0;
+            last_alt_ns_ = stamp_ns;
+            RCLCPP_WARN(this->get_logger(), "GNSS-only fallback: fading a %.2f m offset to the last fused pose over %.0f s",
+                        entry_offset_.norm(), blend_time_);
+        }
+        const double since = static_cast<double>(stamp_ns - fallback_entry_ns_) * 1e-9;
+        const double fade = blend_time_ > 0.0 ? std::clamp(1.0 - since / blend_time_, 0.0, 1.0) : 0.0;
+        const Eigen::Vector3d offset = fade * entry_offset_;
+        // Height: the GNSS altitude change since entry, low-passed (it wanders by
+        // most of a metre), on top of the last fused height.
+        if (altitude_tau_ > 0.0)
+        {
+            const double dt = std::max(static_cast<double>(stamp_ns - last_alt_ns_) * 1e-9, 0.0);
+            const double a = 1.0 - std::exp(-dt / altitude_tau_);
+            alt_lp_ += a * ((raw.z() - alt_ref_) - alt_lp_);
+        }
+        last_alt_ns_ = stamp_ns;
+        const double z = z_entry_ + (altitude_tau_ > 0.0 ? alt_lp_ : 0.0);
+        fallback_z_ = z;
+        have_fallback_z_ = true;
+
+        const double yaw = yaw_filter_.yawAt(stamp_ns);
+        const gtsam::Pose3 pose(gtsam::Rot3::Rz(yaw),
+                                gtsam::Point3(raw.x() + offset.x(), raw.y() + offset.y(), z));
+        Eigen::Matrix<double, 6, 6> C = Eigen::Matrix<double, 6, 6>::Zero();
+        const double s = std::max(sigma, options_.gnss_sigma);
+        C(0, 0) = C(1, 1) = fallback_tilt_sigma_ * fallback_tilt_sigma_;
+        C(2, 2) = std::pow(std::max(yaw_filter_.yawSigma(), 1e-3), 2);
+        C(3, 3) = C(4, 4) = s * s + offset.squaredNorm();
+        C(5, 5) = fallback_z_sigma_ * fallback_z_sigma_;
+        std_msgs::msg::Bool health;
+        health.data = true;
+        degraded_pub_->publish(health);
+        ++fallback_poses_;
+        publish(pose, stamp, &C);
     }
 
     using StatusClock = std::chrono::steady_clock;
@@ -489,13 +749,28 @@ private:
         // single fix), so it replaces the datum-differenced z outright rather
         // than needing datum_.z() subtracted from it too.
         if (have_rel_altitude_) local.z() = rel_altitude_;
+        const int64_t fix_ns = ns(msg->header.stamp);
+        if (fallback_enabled_ && !gps_only_)
+        {
+            // Sim time reads 0 until the first /clock; do not start the grace period on it.
+            const rclcpp::Time now = this->now();
+            if (now.nanoseconds() > 0 && (!have_first_fix_rx_ || now < first_fix_rx_))
+            {
+                if (!have_first_fix_rx_ || now < first_fix_rx_) first_fix_rx_ = now;
+                have_first_fix_rx_ = true;
+            }
+            recordRaw(fix_ns, local);
+        }
         if (!position_alignment_) local -= leverArmOffset();
         const double vertical_variance = msg->position_covariance[8];
         const double vertical_sigma = msg->position_covariance_type != sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN &&
                                       std::isfinite(vertical_variance) && vertical_variance > 0
             ? std::sqrt(vertical_variance) : 0.0;
-        graph_->setGnss(ns(msg->header.stamp), local, sigma, vertical_sigma);
+        graph_->setGnss(fix_ns, local, sigma, vertical_sigma);
         if (gps_only_) publishGpsOnly(local, sigma, msg->header.stamp);
+        if ((in_fallback_ || degraded_fallback_) && !raw_.empty() && raw_.back().stamp_ns == fix_ns &&
+            sigma <= options_.gnss_max_sigma)
+            publishFallback(fix_ns, msg->header.stamp, sigma);
         if (debug_gnss_only_ && !position_alignment_) publishGnssOnlyDebug(local, msg->header.stamp);
     }
 
@@ -603,6 +878,7 @@ private:
         last_heading_sigma_ = sigma;
         gnss_heading_ns_ = ns(msg->header.stamp);
         graph_->setHeading(gnss_heading_ns_, heading_, sigma);
+        headingToFilter(gnss_heading_ns_ + static_cast<int64_t>(options_.heading_time_offset * 1e9), heading_, sigma);
     }
 
     // Fallback when heading.use_gnss_heading is false: the FCU's own fused
@@ -626,6 +902,8 @@ private:
         last_heading_sigma_ = compass_heading_sigma_;
         gnss_heading_ns_ = this->now().nanoseconds();
         graph_->setHeading(gnss_heading_ns_, heading_, compass_heading_sigma_);
+        headingToFilter(gnss_heading_ns_ + static_cast<int64_t>(options_.heading_time_offset * 1e9), heading_,
+                        compass_heading_sigma_);
     }
 
 
@@ -648,7 +926,8 @@ private:
                     world_frame_.c_str(), map_frame_.c_str());
     }
 
-    void publish(const gtsam::Pose3& local_pose, const builtin_interfaces::msg::Time& stamp)
+    void publish(const gtsam::Pose3& local_pose, const builtin_interfaces::msg::Time& stamp,
+                 const Eigen::Matrix<double, 6, 6>* covariance = nullptr)
     {
         if (!publishing_enabled_) return;
         const gtsam::Pose3 pose(map_from_local_ * local_pose.rotation(),
@@ -683,6 +962,7 @@ private:
         }
         if (!gps_only_ && graph_->gpsHeightAiding())
             Craw(5, 5) = std::max(Craw(5, 5), gps_height_sigma_floor_ * gps_height_sigma_floor_);
+        if (covariance) Craw = *covariance;
         if (gps_only_)
         {
             Craw.setZero();
@@ -707,7 +987,8 @@ private:
         // via TF -- every consumer reads the pose off this topic instead. So gnocchi
         // only ever hands out world -> map; leave base_link to whatever owns it
         // (e.g. a VIO source's own map -> base_link).
-        if (!publish_tf_ || gps_only_) return;
+        // In fallback there is no live odom frame to align.
+        if (!publish_tf_ || gps_only_ || covariance) return;
         // map -> odom, the live alignment.
         const gtsam::Pose3 l = graph_->worldFromOdom();
         const gtsam::Pose3 c = gtsam::Pose3(map_from_local_ * l.rotation(),
@@ -728,6 +1009,29 @@ private:
     }
 
     std::unique_ptr<PoseGraph> graph_;
+    Options options_;
+
+    // GNSS-only fallback state.
+    bool fallback_enabled_ = false, in_fallback_ = false, graph_rebuilt_ = false;
+    bool fused_healthy_ = false, fallback_entry_pending_ = false;
+    bool on_lio_degraded_ = false, degraded_fallback_ = false;
+    double rebuild_after_ = 2.0;
+    double odom_timeout_ = 0.5, startup_wait_ = 10.0, odom_jump_ = 2.0, blend_time_ = 10.0;
+    double max_heading_age_ = 30.0, altitude_tau_ = 5.0, fallback_z_sigma_ = 1.0;
+    double fallback_tilt_sigma_ = 0.05, fused_yaw_sigma_floor_ = 0.01;
+    YawFilter yaw_filter_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::TimerBase::SharedPtr watchdog_;
+    rclcpp::Time last_odom_rx_{0, 0, RCL_ROS_TIME}, first_fix_rx_{0, 0, RCL_ROS_TIME};
+    bool have_odom_rx_ = false, have_first_fix_rx_ = false;
+    gtsam::Pose3 last_fused_;
+    int64_t last_fused_ns_ = 0, fallback_entry_ns_ = 0, last_alt_ns_ = 0;
+    struct RawFix { int64_t stamp_ns; Eigen::Vector3d body; };
+    std::deque<RawFix> raw_;
+    Eigen::Vector3d entry_offset_ = Eigen::Vector3d::Zero();
+    double z_entry_ = 0.0, alt_ref_ = 0.0, alt_lp_ = 0.0, fallback_z_ = 0.0;
+    bool have_fallback_z_ = false;
+    size_t fallback_poses_ = 0;
     rclcpp::CallbackGroup::SharedPtr sensor_group_;
     std::atomic<bool> publishing_enabled_{true};
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr initialization_trigger_sub_;

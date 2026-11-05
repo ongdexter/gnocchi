@@ -111,6 +111,10 @@ public:
     void setGnss(int64_t stamp_ns, const Eigen::Vector3d& enu, double sigma, double vertical_sigma = 0.0);
     void setHeading(int64_t stamp_ns, double yaw_enu, double sigma);
 
+    // Height the first keyframe takes instead of the odometry's own z, so a graph
+    // rebuilt after an odometry restart continues at the height it left off.
+    void setInitialZ(double z) { initial_z_ = z; }
+
     // The clock. Returns true when this reading created a keyframe.
     bool addOdometry(int64_t stamp_ns, const Eigen::Isometry3d& odom);
 
@@ -201,6 +205,7 @@ private:
     bool have_odom_ = false;
     // world_z - odom_z, fixed when the origin is set.
     double z_offset_ = 0.0;
+    std::optional<double> initial_z_;
 
     // Newest measurements, awaiting the next keyframe.
     Eigen::Vector3d gnss_ = Eigen::Vector3d::Zero();

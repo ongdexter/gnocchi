@@ -54,9 +54,10 @@ publishes anything.
 **Inputs** (`config/ugv.yaml`): `rko_lio/odometry`, `mavros/global_position/
 raw/fix`, and dual-antenna heading from every configured GPS instance
 (default `mavros/gpsstatus/gps1/raw` and `gps2/raw` — whichever reports a
-valid moving-baseline yaw is used). There is no IMU input: lidar odometry is
-itself gravity-aligned and supplies roll/pitch, and yaw always comes from the
-heading prior, never the odometry frame.
+valid moving-baseline yaw is used). The graph has no IMU input: lidar odometry
+is itself gravity-aligned and supplies roll/pitch, and yaw always comes from the
+heading prior, never the odometry frame. The FCU gyro (`mavros/imu/data`) is used
+only by the GNSS-only fallback below.
 
 **Inputs** (`config/uav.yaml`): `mavros/global_position/global` and the same
 dual-antenna heading topics. No odometry, and — since there's no IMU either —
@@ -296,3 +297,53 @@ allowance of at least the configured sigma floor squared while aiding is active;
 this allowance is not a calibrated failure-mode covariance. Degraded logs report
 `GPS height aiding` and the cumulative height-factor count. UAV GPS-only behavior
 is unchanged.
+
+
+## GNSS-only fallback when lidar odometry fails (UGV)
+
+`fallback.enabled` (on in `ugv.yaml`, off by default in the node) keeps `odom_map` /
+`pose_map` publishing when RKO-LIO stops, restarts or (`fallback.on_lio_degraded`)
+is flagged by `lio_health`:
+
+- **Trigger:** no odometry for `odom_timeout` (0.5 s); an odometry step larger than
+  `odom_jump` (a restarted source starting again at its origin); or, with
+  `on_lio_degraded`, a `lio_health` fault. If odometry never arrives, GNSS-only
+  output starts `startup_wait` (10 s) after the first fix.
+- **Output:** the fix, lever-arm corrected, published at the fix rate. The step
+  from the last fused pose is faded out over `blend_time` (10 s). Height is held
+  at the last fused value (`altitude_tau: 0`); GNSS altitude was worse than holding
+  on the test bags. Roll and pitch are level: FCU attitude was no closer to LIO
+  than that. `lio_degraded` is true while this runs. `map -> odom` TF is not
+  published, because there is no live odom frame to align.
+- **Yaw:** a yaw + gyro-bias Kalman filter (`yaw_filter.hpp`) runs all the time.
+  While the graph is healthy it follows the fused yaw. Otherwise it follows the
+  dual-antenna heading (lag-corrected by `heading.time_offset`). Between those
+  updates it integrates the FCU gyro (`fallback.imu_topic`; empty = heading only,
+  held at most 1 s). After `max_heading_age` (30 s) without a heading it stops
+  publishing rather than trust the gyro further.
+- **Recovery:** when odometry returns after more than `rebuild_after` (2 s), or
+  with a jump, the graph is rebuilt in the new odom frame at the current height.
+  GNSS-only output continues until the new graph has `optimizer.min_keyframes`.
+  A shorter stall in the same frame continues the old graph.
+
+Measured by bag replay (`ugv_gnocchi_long`; reference = LIO rigidly aligned to
+the fused run; LIO cut from 60 s to the end):
+
+| | horizontal rms / max | yaw p95 / max | height rms |
+|---|---|---|---|
+| fused (LIO healthy) | 0.32 / 0.79 m | 1.8 / 4.3 deg | 0.01 m |
+| GNSS-only, 280 s | 0.59 / 1.07 m | 2.5 / 7.8 deg | 0.57 m |
+| same, plus three 20-30 s heading outages | 0.59 / 1.07 m | 3.9 / 8.8 deg | 0.58 m |
+| LIO restarted twice (60 s and 30 s gaps) | 0.52 / 1.03 m | 2.1 / 7.6 deg | 0.60 m |
+
+Without the gyro, holding the last heading through 30 s outages was off by tens
+of degrees. With it, yaw stayed within about 2 deg (median). One exception: in
+`tree_tarp_badloc`, during violent oscillating motion, the FCU gyro was off by
+about 7 deg/s against both GNSS heading and LIO. That is why gyro-only bridging
+is capped. On the field bags where LIO degrades, `on_lio_degraded` cut the largest
+single output step from 4.45 m to 0.65 m (`long_road_bad`) and from 2.46 m to
+0.51 m (`tree_tarp_badloc`).
+
+GNSS-only accuracy is GNSS accuracy: about 0.5 m of slow wander with this
+receiver (not RTK for position), with good fix-to-fix smoothness (3 cm median).
+It does not repair map points from before the failure.

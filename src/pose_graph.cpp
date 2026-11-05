@@ -254,9 +254,10 @@ bool PoseGraph::tryInitialize(int64_t stamp_ns, const Eigen::Isometry3d& odom)
         body_gnss -= world_rotation * sample->rotation() * options_.alignment.antenna;
         body_gnss += world_rotation * (odom.translation() - sample->translation());
     }
-    // z comes from the odometry, not the fix.
+    // z comes from the odometry, not the fix, unless a rebuilt graph carries
+    // the previous estimate's height over.
     const gtsam::Pose3 pose(
-        rotation, gtsam::Point3(body_gnss.x(), body_gnss.y(), odom.translation().z()));
+        rotation, gtsam::Point3(body_gnss.x(), body_gnss.y(), initial_z_.value_or(odom.translation().z())));
 
     values_.insert(X(next_key_), pose);
     stamps_[X(next_key_)] = static_cast<double>(stamp_ns) * 1e-9;

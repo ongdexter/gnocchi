@@ -59,6 +59,30 @@
       recovery: 30.0
       degraded_translation_sigma: 10.0
       degraded_rotation_sigma: 0.5
+    # GNSS-only output while lidar odometry is missing (crash/restart/stall).
+    # Position: GNSS fix (~0.5 m wander, 3 cm fix-to-fix in the bags). Yaw: the
+    # dual-antenna heading, with the FCU gyro carrying it through heading dropouts
+    # (up to 23 s under trees in the field bags). Roll/pitch are level: the FCU
+    # attitude was measured no closer to LIO than assuming level.
+    fallback:
+      enabled: true
+      imu_topic: mavros/imu/data   # '' = heading only, held at most 1 s across gaps
+      odom_timeout: 0.5            # s without odometry before switching
+      startup_wait: 10.0           # s after the first fix if odometry never arrives
+      odom_jump: 2.0               # m step between odometry messages = source restarted
+      rebuild_after: 2.0           # s; a shorter stall without a jump continues the old graph
+      on_lio_degraded: true        # also GNSS-only while lio_health flags LIO: largest output step
+                                   # 4.45 -> 0.65 m (long_road_bad), 2.46 -> 0.51 m (tree_tarp)
+      blend_time: 10.0             # s to fade the step from the last fused pose to GNSS
+      max_heading_age: 30.0        # s the gyro may bridge; beyond it nothing is published
+      altitude_tau: 0.0            # 0 holds the last fused height (0.58 m rms vs 1.21 m tracking
+                                   # GNSS altitude on ugv_gnocchi_long); >0: s low-pass on GNSS altitude change
+      z_sigma: 1.0
+      tilt_sigma_deg: 3.0
+      fused_yaw_sigma_floor_deg: 0.5
+      gyro_noise: 0.05
+      gyro_bias_random_walk: 1.0e-6
+      gyro_max_bias_deg: 2.0
     # Weak relative GPS height after LIO failure; healthy operation is unchanged.
     gps_height:
       enabled: true
