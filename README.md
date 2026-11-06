@@ -132,8 +132,10 @@ different rates, so the other receiver is extrapolated to each fix's stamp
 offset from the midpoint in the body frame (logged once as "Antenna offsets").
 When one loses its fix (the rover does under trees), the other is used alone,
 moved by that offset, after `gnss.min_offset_samples` paired fixes. In replay,
-cutting either receiver for 30 s moved the output by at most 6 mm. Without
-`gnss.receivers`, `topics.gnss` (a `NavSatFix`) is used as before, as on the UAV.
+cutting either receiver for 30 s moved the output by at most 6 mm. With a
+single topic in `gnss.receivers`, that receiver is used alone at
+`extrinsics.gnss_antenna`. Without `gnss.receivers` (or with `[""]`: parameter files cannot hold an empty list), `topics.gnss` (any
+`NavSatFix`, e.g. the FCU's `global_position/global`) is used instead.
 
 `config/` holds only the two deployment profiles, `ugv.yaml` and `uav.yaml`.
 Each file's own comments explain its tuning in detail — several sigmas (e.g.

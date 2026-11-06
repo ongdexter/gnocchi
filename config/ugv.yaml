@@ -9,6 +9,7 @@
     initialization_trigger_topic: /initialization_trigger
     topics:
       odom: bievr_lio/odom   # was rko_lio/odometry; sensors_lio.launch.py lio:=rko_lio
+      gnss: mavros/global_position/raw/fix   # only when gnss.receivers is empty (single-fix setups)
       output_odom: odom_map
       output_odom_throttled: odom_map_throttled
       output_pose: pose_map
@@ -99,6 +100,7 @@
       # numbered first: the rover in 7 of the field bags, the base in 3. Their
       # midpoint is fused; if one has no fix, the other is used alone, offset by
       # what gnocchi learned from paired fixes (logged once: "Antenna offsets").
+      # One topic: a single receiver at extrinsics.gnss_antenna. Delete the line (or set [""]) for topics.gnss.
       receivers: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
       pair_max_dt: 0.25        # s; the receivers' stamps are mavros receive times
       min_offset_samples: 100  # paired, non-turning fixes before either may be used alone

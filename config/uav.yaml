@@ -9,7 +9,7 @@
     initialization_trigger_topic: /initialization_trigger
     topics:
       odom: ""
-      gnss: mavros/global_position/global
+      gnss: mavros/global_position/global   # only when gnss.receivers is empty (single-fix setups)
       # FCU-fused (baro+GPS+IMU) altitude relative to home, in place of the raw
       # single-fix GNSS altitude for the output pose's z.
       rel_altitude: mavros/global_position/rel_alt
@@ -24,8 +24,9 @@
       compass_topic: mavros/global_position/compass_hdg
       compass_sigma_deg: 5.0
     extrinsics:
-      # GNSS antenna in base_link (FLU)
-      gnss_antenna: {x: 0.0, y: -0.25, z: 0.0}
+      # Antenna MIDPOINT in base_link (FLU), as gnss.receivers fuses the midpoint,
+      # which is the body centre. z is unused: rel_altitude replaces GNSS height.
+      gnss_antenna: {x: 0.0, y: 0.0, z: 0.0}
     frames:
       # ENU / UTM, absolute.
       world: world
@@ -40,5 +41,12 @@
     # waypoint conversion and cross-vehicle frame reprojection need.
     publish_tf: true
     gnss:
+      # Both antennas, fused as their midpoint (see ugv.yaml / README): PX4's
+      # numbering of the two receivers changes between boots, so a single fix
+      # topic reports a different antenna from run to run. One topic: a single
+      # receiver at extrinsics.gnss_antenna. Delete the line (or set [""]) for topics.gnss.
+      receivers: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      pair_max_dt: 0.25
+      min_offset_samples: 100
       sigma: 0.5
       max_sigma: 3.0

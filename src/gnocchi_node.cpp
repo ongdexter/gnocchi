@@ -14,6 +14,7 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -252,10 +253,14 @@ public:
                         odom_timeout_, imu_topic.empty() ? "dual-antenna/compass" : "gyro-propagated",
                         imu_topic.empty() ? 0.0 : max_heading_age_);
         }
-        // Either one fix topic (topics.gnss), or the two receivers of a dual-antenna
-        // install (gnss.receivers), fused as their midpoint. See onReceiverFix.
-        const auto receiver_topics = this->declare_parameter<std::vector<std::string>>(
+        // gnss.receivers: one GPSRAW topic (a single receiver, at extrinsics.gnss_antenna)
+        // or two (a dual-antenna install, fused as their midpoint; see onReceiverFix).
+        // Empty: topics.gnss, any NavSatFix (e.g. the FCU's global_position/global).
+        // ROS 2 parameter files cannot hold an empty list, so [""] also means none.
+        auto receiver_topics = this->declare_parameter<std::vector<std::string>>(
             "gnss.receivers", std::vector<std::string>{});
+        receiver_topics.erase(std::remove(receiver_topics.begin(), receiver_topics.end(), std::string()),
+                              receiver_topics.end());
         if (receiver_topics.empty())
         {
             gnss_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -265,13 +270,13 @@ public:
         }
         else
         {
-            if (receiver_topics.size() != 2)
-                throw std::invalid_argument("gnss.receivers takes exactly two topics, one per antenna");
+            if (receiver_topics.size() > 2)
+                throw std::invalid_argument("gnss.receivers takes one topic per antenna, at most two");
             pair_max_dt_ = get("gnss.pair_max_dt", pair_max_dt_);
             min_offset_samples_ = static_cast<size_t>(
                 this->declare_parameter("gnss.min_offset_samples", static_cast<int>(min_offset_samples_)));
-            receivers_.resize(2);
-            for (size_t i = 0; i < 2; ++i)
+            receivers_.resize(receiver_topics.size());
+            for (size_t i = 0; i < receivers_.size(); ++i)
             {
                 receivers_[i].topic = receiver_topics[i];
                 receiver_subs_.push_back(this->create_subscription<mavros_msgs::msg::GPSRAW>(
@@ -279,10 +284,14 @@ public:
                     [this, i](const mavros_msgs::msg::GPSRAW::ConstSharedPtr m) { onReceiverFix(m, i); },
                     opts));
             }
-            RCLCPP_INFO(this->get_logger(),
-                        "GNSS position: midpoint of %s and %s (either alone, offset by what it "
-                        "learns from paired fixes, when the other has no fix)",
-                        receiver_topics[0].c_str(), receiver_topics[1].c_str());
+            if (receivers_.size() == 1)
+                RCLCPP_INFO(this->get_logger(), "GNSS position: %s, antenna at extrinsics.gnss_antenna",
+                            receiver_topics[0].c_str());
+            else
+                RCLCPP_INFO(this->get_logger(),
+                            "GNSS position: midpoint of %s and %s (either alone, offset by what it "
+                            "learns from paired fixes, when the other has no fix)",
+                            receiver_topics[0].c_str(), receiver_topics[1].c_str());
         }
         // Optional: a fused relative-altitude topic (e.g. mavros' rel_alt, itself
         // barometer+GPS+IMU fused by the FCU) in place of the raw single-fix GNSS
@@ -806,6 +815,12 @@ private:
         r.vertical_sigma = msg->v_acc > 0 ? msg->v_acc * 1e-3 : 0.0;
         r.sigma = (fuse_gps_altitude_ || gps_only_) ? std::max(h, r.vertical_sigma) : h;
 
+        if (receivers_.size() == 1)
+        {
+            acceptFix(t, msg->header.stamp, p, zone, r.sigma, r.vertical_sigma);
+            last_fix_status_ = "valid";
+            return;
+        }
         const Receiver& o = receivers_[1 - i];
         const double to_other = static_cast<double>(t - o.stamp_ns) * 1e-9;
         if (o.valid && std::abs(to_other) <= pair_max_dt_)
