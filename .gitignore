@@ -1,0 +1,20 @@
+# colcon output, if built from inside the package
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Bags and analysis output
+*.db3
+*.mcap
+*.bag
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

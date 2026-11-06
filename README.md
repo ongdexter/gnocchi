@@ -11,20 +11,26 @@ only — no velocity or IMU-bias states.
 With no odometry configured the graph drops out entirely and the node becomes a
 GNSS-to-local-frame converter. That is the UAV profile.
 
-| | UGV (`ugv.yaml`) | UAV (`uav.yaml`) |
-|---|---|---|
-| mode | fused pose graph | GPS-only |
-| odometry | `rko_lio/odometry` | none |
-| output frame | `ugv_map` | `uav_map` |
-| rate | odometry rate (~30 Hz) | fix rate, ~42 Hz |
-| TF | `world->map` static, `map->odom` live | none (`publish_tf: false`) |
+| | UGV (`ugv.yaml`) | UAV (`uav.yaml`) | low-alt UAV (`lowalt_uav.yaml`) |
+|---|---|---|---|
+| mode | fused pose graph | GPS-only | fused pose graph |
+| odometry | `bievr_lio/odom` | none | `zed/zed_node/odom` (VIO) |
+| heading | dual-antenna | dual-antenna | PX4 `compass_hdg`, or fitted from motion |
+| output frame | `ugv_map` | `uav_map` | `lowalt_uav_map` |
+| rate | odometry rate (~30 Hz) | fix rate, ~42 Hz | odometry rate |
+| TF | `world->map` static, `map->odom` live | `world->map` static | `world->map` static, `map->odom` live |
 
 ## Run
 
 ```bash
 ros2 launch gnocchi ugv.launch.py    # UGV
 ros2 launch gnocchi uav.launch.py    # UAV
+ros2 launch gnocchi lowalt_uav.launch.py    # low-altitude UAV
 ```
+
+The low-altitude UAV profile is UNVERIFIED on real data. It has no absolute
+heading reference: see the header of `config/lowalt_uav.yaml` for the two yaw
+options and the ZED launch settings it depends on (`publish_map_tf:=false`).
 
 Both take `use_sim_time`, and `config` if you need to point at a config file
 other than each launch file's default (`ugv.yaml` / `uav.yaml`).
@@ -137,7 +143,7 @@ single topic in `gnss.receivers`, that receiver is used alone at
 `extrinsics.gnss_antenna`. Without `gnss.receivers` (or with `[""]`: parameter files cannot hold an empty list), `topics.gnss` (any
 `NavSatFix`, e.g. the FCU's `global_position/global`) is used instead.
 
-`config/` holds only the two deployment profiles, `ugv.yaml` and `uav.yaml`.
+`config/` holds only the deployment profiles: `ugv.yaml`, `uav.yaml` and `lowalt_uav.yaml`.
 Each file's own comments explain its tuning in detail — several sigmas (e.g.
 `odom.rotation_floor`) were re-derived from real gyro comparisons, so treat
 them as measured, not as defaults to copy elsewhere without re-checking.

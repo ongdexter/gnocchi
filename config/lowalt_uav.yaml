@@ -1,0 +1,161 @@
+# Low-altitude UAV: ZED stereo VIO odometry fused with a single-antenna GNSS.
+# The UGV pose graph with a camera in place of the lidar, and no dual-antenna
+# heading. UNVERIFIED on real data -- every sigma below is argued, not measured.
+#
+# Division of labour is the same as on the UGV: the VIO owns local geometry
+# (and therefore height above the ground the mapper sees), GNSS only stops it
+# drifting across tens of metres. GNSS altitude is never fused.
+#
+# What is different without a second antenna: there is no absolute yaw
+# reference that a heading prior can pin. Yaw comes from either
+#   (a) PX4's own yaw (compass_hdg, the EKF2 estimate: mag + GPS-velocity aided),
+#       available at takeoff -- the default here; or
+#   (b) heading.initialize_from_positions: fitted from VIO vs GNSS tracks.
+#       Truthful, but nothing publishes until ~10 m of flight, so the planner
+#       cannot start the vehicle on its own.
+# Either way, after initialization the GNSS position factors correct yaw only in
+# proportion to the baseline flown: the ~0.5 m GNSS bias over a 10 m leg is ~3 deg.
+#
+# VERIFY before flying:
+#   - extrinsics.gnss_antenna: measure it, in the ZED odometry child frame.
+#   - ZED: launch with publish_map_tf:=false. gnocchi publishes
+#     lowalt_uav_map -> odom; ZED's own map -> odom would give odom two parents.
+#   - ZED: use zed_node/odom (continuous), never zed_node/pose (jumps on
+#     area-memory relocalization).
+#   - heading.compass_sigma_deg / time_offset have not been measured on this
+#     airframe. Re-measure the offset with scripts/measure_heading_lag.py.
+/**/gnocchi:
+  ros__parameters:
+    enable_gnss: true
+    publish_on_trigger: false
+    initialization_trigger_topic: /initialization_trigger
+    topics:
+      # driver_launch with robot_ns:=lowalt_uav puts the ZED at
+      # /lowalt_uav/zed/zed_node; relative names resolve under the namespace.
+      odom: zed/zed_node/odom
+      # The RAW fix (GPS_RAW_INT), not global_position/global: a measurement of
+      # the antenna rather than an EKF posterior already fused with the IMU, so
+      # the lever arm applies and it is not double-counted against the VIO.
+      gnss: mavros/global_position/raw/fix
+      # FCU baro-fused altitude in place of raw GNSS altitude. Only used by
+      # gps_height recovery after a VIO failure (fuse_altitude stays false).
+      rel_altitude: mavros/global_position/rel_alt
+      output_odom: odom_map
+      output_odom_throttled: odom_map_throttled
+      output_pose: pose_map
+      output_pose_throttled: pose_map_throttled
+    extrinsics:
+      # GNSS antenna in the odometry child frame (FLU). ZED odometry reports the
+      # camera, not the airframe centre, so measure from the left camera optical
+      # centre's parent (zed_camera_link). PLACEHOLDER -- measure it.
+      gnss_antenna: {x: 0.0, y: 0.0, z: 0.0}
+    frames:
+      world: world
+      # NWU, origin at the first accepted fix. Matches map_ros.frame_id in
+      # exploration_lowalt_uav.yaml.
+      map: lowalt_uav_map
+      map_yaw_deg: 90.0
+      odom: odom
+      # gnocchi's output pose is the odometry child's pose; it applies no
+      # camera -> airframe extrinsic of its own.
+      base_link: zed_camera_link
+      expect_odom_child: zed_camera_link
+    publish_tf: true
+    keyframe:
+      distance: 0.5
+      angle_deg: 10.0
+      max_time: 1.0
+    odom:
+      # Stereo VIO jitters at the cm level per keyframe, a few times the lidar's.
+      translation_floor: 0.02
+      # The correction range, as on the UGV: how far GNSS may deform the chain.
+      # VIO drifts faster than lidar odometry (~0.5-2 % of distance outdoors vs
+      # 0.0035 % for RKO-LIO), so this is the first knob to tune from a bag.
+      translation_sigma_per_m: 0.05
+      # Without an absolute heading prior, yaw is held mainly by the VIO. A loose
+      # rotation sigma would let GNSS bias twist the chain, so keep it tight.
+      rotation_floor: 0.01
+      rotation_sigma_per_m: 0.005
+      rotation_sigma_per_rad: 0.02
+      # ZED VIO is gravity-aligned through its own IMU.
+      attitude_sigma: 0.05
+      z_sigma: 0.1
+    lio_health:            # applies to any odometry source despite the name
+      enabled: true
+      max_speed: 5.0
+      gps_max_speed: 5.0
+      disagreement: 3.0
+      window: 2.0
+      confirmation: 0.5
+      recovery: 30.0
+      degraded_translation_sigma: 10.0
+      degraded_rotation_sigma: 0.5
+    # GNSS-only output if VIO stalls or is flagged. A consumer flying near
+    # obstacles should treat lio_degraded=true as "hold or land", not carry on
+    # at GNSS accuracy (~0.5 m, level attitude).
+    fallback:
+      enabled: true
+      imu_topic: mavros/imu/data
+      odom_timeout: 0.5
+      startup_wait: 10.0
+      odom_jump: 2.0
+      rebuild_after: 2.0
+      on_lio_degraded: true
+      blend_time: 10.0
+      max_heading_age: 30.0
+      altitude_tau: 0.0
+      z_sigma: 1.0
+      tilt_sigma_deg: 3.0
+      fused_yaw_sigma_floor_deg: 0.5
+      gyro_noise: 0.05
+      gyro_bias_random_walk: 1.0e-6
+      gyro_max_bias_deg: 2.0
+    gps_height:
+      enabled: true
+      sigma_floor: 3.0
+      max_reported_sigma: 2.0
+      max_speed: 2.0
+      reference_window: 30.0
+      reference_delay: 3.0
+      recovery_ramp_time: 5.0
+    gnss:
+      min_interval: 1.0
+      sigma: 1.0
+      max_sigma: 2.0
+      robust_k: 1.345
+      # Height above ground is a local quantity the VIO and the map already
+      # agree on; GNSS altitude would only inject metre-level corrections.
+      fuse_altitude: false
+      sigma_z: 3.0
+    heading:
+      # (a) PX4 yaw. Its error is a slowly varying bias (mag disturbance, the
+      # UGV's steel at launch), not white noise, so priors are spaced out: dense
+      # 5 deg priors would average to false confidence in a biased yaw.
+      use_gnss_heading: false
+      compass_topic: mavros/global_position/compass_hdg
+      compass_sigma_deg: 5.0
+      min_interval: 2.0
+      # compass_hdg carries no stamp; gnocchi stamps it on receipt.
+      time_offset: 0.0
+      robust_k: 1.345
+      max_gap: 1.0
+      max_rate: 0.0
+      # (b) set true to ignore compass_hdg and fit yaw from motion instead.
+      initialize_from_positions: false
+      alignment:
+        window: 60.0
+        min_samples: 10
+        min_baseline: 10.0
+        max_residual: 1.5
+        max_gap: 0.5
+        sigma_floor_deg: 10.0
+        max_sigma_deg: 20.0
+    origin_z_sigma: 0.5
+    max_measurement_age: 0.5
+    optimizer:
+      fixed_lag: false
+      lag_time: 30.0
+      min_keyframes: 5
+    debug:
+      publish_gnss_only: false
+      gnss_only_topic: debug/gnss_only
