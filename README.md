@@ -51,10 +51,10 @@ When replaying a bag, start the node **before** playback and play with
 `optimizer.min_keyframes` (default 5) keyframes of motion after that before it
 publishes anything.
 
-**Inputs** (`config/ugv.yaml`): `rko_lio/odometry`, `mavros/global_position/
-raw/fix`, and dual-antenna heading from every configured GPS instance
-(default `mavros/gpsstatus/gps1/raw` and `gps2/raw` — whichever reports a
-valid moving-baseline yaw is used). The graph has no IMU input: lidar odometry
+**Inputs** (`config/ugv.yaml`): `bievr_lio/odom`, both GNSS receivers
+(`gnss.receivers`: `mavros/gpsstatus/gps1/raw` and `gps2/raw`, see below), and
+dual-antenna heading from every configured GPS instance (the same two topics —
+whichever reports a valid moving-baseline yaw is used). The graph has no IMU input: lidar odometry
 is itself gravity-aligned and supplies roll/pitch, and yaw always comes from the
 heading prior, never the odometry frame. The FCU gyro (`mavros/imu/data`) is used
 only by the GNSS-only fallback below.
@@ -118,6 +118,22 @@ coordinates, which would blow float32 precision. If `extrinsics.gnss_antenna`
 is set, that lever arm (FLU, in `base_link`) is removed from every fix before
 it reaches the graph, rotated by yaw only (there is no roll/pitch source to
 rotate it by, and it stays zero until the first heading arrives).
+
+**Two receivers** (`gnss.receivers`, UGV). mavros' `global_position/raw/fix`
+is whichever receiver PX4 numbered gps1, and that changes between boots: in the
+field bags it was the moving-baseline rover in seven and the base in three, and
+the two antennas are 0.47 m apart across the robot. So gnocchi takes both
+receivers' `GPSRAW` fixes and fuses their **midpoint**, which is `base_link`
+horizontally on the UGV (fitting LIO to GNSS put it within 5 cm laterally on
+three bags); `extrinsics.gnss_antenna` is then the midpoint's offset, i.e. at
+most a height. The stamps are mavros receive times and the receivers run at
+different rates, so the other receiver is extrapolated to each fix's stamp
+(`gnss.pair_max_dt`). While both have fixes, gnocchi learns each antenna's
+offset from the midpoint in the body frame (logged once as "Antenna offsets").
+When one loses its fix (the rover does under trees), the other is used alone,
+moved by that offset, after `gnss.min_offset_samples` paired fixes. In replay,
+cutting either receiver for 30 s moved the output by at most 6 mm. Without
+`gnss.receivers`, `topics.gnss` (a `NavSatFix`) is used as before, as on the UAV.
 
 `config/` holds only the two deployment profiles, `ugv.yaml` and `uav.yaml`.
 Each file's own comments explain its tuning in detail — several sigmas (e.g.

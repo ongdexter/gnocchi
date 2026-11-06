@@ -1,6 +1,7 @@
 # UGV: BIEVR-LIO odometry (RKO-LIO before 2026-11-05) with GNSS position and dual-antenna heading priors.
-# Fuses the RAW fix: it reports the antenna, so the lever arm applies, and it is
-# a measurement rather than an estimator posterior. See README for the rest.
+# Fuses the two receivers' raw fixes as their midpoint (gnss.receivers): measurements
+# rather than an estimator posterior, and independent of which receiver PX4 numbers
+# gps1. See README for the rest.
 /**/gnocchi:
   ros__parameters:    
     enable_gnss: true # false: only publish static identity world -> ugv_map -> odom for indoor tests.
@@ -8,14 +9,15 @@
     initialization_trigger_topic: /initialization_trigger
     topics:
       odom: bievr_lio/odom   # was rko_lio/odometry; sensors_lio.launch.py lio:=rko_lio
-      gnss: mavros/global_position/raw/fix
       output_odom: odom_map
       output_odom_throttled: odom_map_throttled
       output_pose: pose_map
       output_pose_throttled: pose_map_throttled
     extrinsics:
-      # GNSS antenna in base_link (FLU)
-      gnss_antenna: {x: 0.0, y: -0.25, z: 0.0}
+      # Antenna MIDPOINT in base_link (FLU), as gnss.receivers fuses the midpoint.
+      # It is base_link horizontally on this UGV. Height only offsets GNSS altitude,
+      # which is not fused (fuse_altitude: false), so it is left at 0.
+      gnss_antenna: {x: 0.0, y: 0.0, z: 0.0}
     frames:
       # ENU / UTM, absolute.
       world: world
@@ -93,6 +95,13 @@
       reference_delay: 3.0
       recovery_ramp_time: 5.0 # seconds to fade the activation mismatch; 0 restores immediate correction
     gnss:
+      # Both antennas, in either order. mavros' raw/fix is just whichever one PX4
+      # numbered first: the rover in 7 of the field bags, the base in 3. Their
+      # midpoint is fused; if one has no fix, the other is used alone, offset by
+      # what gnocchi learned from paired fixes (logged once: "Antenna offsets").
+      receivers: ["mavros/gpsstatus/gps1/raw", "mavros/gpsstatus/gps2/raw"]
+      pair_max_dt: 0.25        # s; the receivers' stamps are mavros receive times
+      min_offset_samples: 100  # paired, non-turning fixes before either may be used alone
       # One-second minimum between position factors improves drift tracking and
       # GPS recovery in bag tests; factors attach at eligible keyframes.
       # Fix errors remain correlated over ~20-40 s: faster fusion also follows

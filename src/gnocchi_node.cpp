@@ -252,10 +252,38 @@ public:
                         odom_timeout_, imu_topic.empty() ? "dual-antenna/compass" : "gyro-propagated",
                         imu_topic.empty() ? 0.0 : max_heading_age_);
         }
-        gnss_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-            this->declare_parameter("topics.gnss", std::string("fix")),
-            rclcpp::SensorDataQoS(),
-            std::bind(&GnocchiNode::onGnss, this, std::placeholders::_1), opts);
+        // Either one fix topic (topics.gnss), or the two receivers of a dual-antenna
+        // install (gnss.receivers), fused as their midpoint. See onReceiverFix.
+        const auto receiver_topics = this->declare_parameter<std::vector<std::string>>(
+            "gnss.receivers", std::vector<std::string>{});
+        if (receiver_topics.empty())
+        {
+            gnss_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+                this->declare_parameter("topics.gnss", std::string("fix")),
+                rclcpp::SensorDataQoS(),
+                std::bind(&GnocchiNode::onGnss, this, std::placeholders::_1), opts);
+        }
+        else
+        {
+            if (receiver_topics.size() != 2)
+                throw std::invalid_argument("gnss.receivers takes exactly two topics, one per antenna");
+            pair_max_dt_ = get("gnss.pair_max_dt", pair_max_dt_);
+            min_offset_samples_ = static_cast<size_t>(
+                this->declare_parameter("gnss.min_offset_samples", static_cast<int>(min_offset_samples_)));
+            receivers_.resize(2);
+            for (size_t i = 0; i < 2; ++i)
+            {
+                receivers_[i].topic = receiver_topics[i];
+                receiver_subs_.push_back(this->create_subscription<mavros_msgs::msg::GPSRAW>(
+                    receiver_topics[i], rclcpp::SensorDataQoS(),
+                    [this, i](const mavros_msgs::msg::GPSRAW::ConstSharedPtr m) { onReceiverFix(m, i); },
+                    opts));
+            }
+            RCLCPP_INFO(this->get_logger(),
+                        "GNSS position: midpoint of %s and %s (either alone, offset by what it "
+                        "learns from paired fixes, when the other has no fix)",
+                        receiver_topics[0].c_str(), receiver_topics[1].c_str());
+        }
         // Optional: a fused relative-altitude topic (e.g. mavros' rel_alt, itself
         // barometer+GPS+IMU fused by the FCU) in place of the raw single-fix GNSS
         // altitude for the output pose's z. Empty (default) keeps the old behavior.
@@ -721,35 +749,142 @@ private:
             last_fix_status_ = "rejected: nonfinite position";
             return;
         }
-        ++fix_valid_;
-        last_valid_fix_received_ = StatusClock::now();
-        last_fix_status_ = "valid";
 
         double northing = 0.0, easting = 0.0;
         char zone[8] = {};
         utm::toUtm(msg->latitude, msg->longitude, northing, easting, zone);
 
-        if (!datum_set_)
-        {
-            // Local metric frame: absolute UTM northings destroy float32 precision downstream.
-            datum_ = Eigen::Vector3d(easting, northing, msg->altitude);
-            zone_ = zone;
-            datum_set_ = true;
-            RCLCPP_INFO(this->get_logger(), "datum: zone %s easting %.2f northing %.2f alt %.2f",
-                        zone_.c_str(), easting, northing, msg->altitude);
-            publishWorldToMap(msg->header.stamp);
-        }
-
         const double variance = (fuse_gps_altitude_ || gps_only_)
             ? std::max({msg->position_covariance[0], msg->position_covariance[4], msg->position_covariance[8]})
             : std::max(msg->position_covariance[0], msg->position_covariance[4]);
         const double sigma = std::isfinite(variance) && variance > 1e-9 ? std::sqrt(variance) : 0.0;
-        Eigen::Vector3d local = Eigen::Vector3d(easting, northing, msg->altitude) - datum_;
+        const double vertical_variance = msg->position_covariance[8];
+        const double vertical_sigma = msg->position_covariance_type != sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN &&
+                                      std::isfinite(vertical_variance) && vertical_variance > 0
+            ? std::sqrt(vertical_variance) : 0.0;
+        acceptFix(ns(msg->header.stamp), msg->header.stamp, Eigen::Vector3d(easting, northing, msg->altitude),
+                  zone, sigma, vertical_sigma);
+        last_fix_status_ = "valid";
+    }
+
+    // Dual-antenna install (gnss.receivers). mavros' raw/fix is whichever receiver
+    // PX4 numbered first, and that changes from boot to boot (the moving-baseline
+    // rover in some field bags, the base in others, 0.47 m apart). The midpoint of
+    // the two does not depend on that, and on this UGV it is base_link's horizontal
+    // position, so extrinsics.gnss_antenna holds only the midpoint's height.
+    //
+    // The stamps are mavros receive times, not GNSS epochs, and the receivers run at
+    // different rates, so the other receiver is extrapolated to this fix's stamp
+    // with its own velocity. When the other has no fix (the rover loses it under
+    // trees), this one is used alone, moved by its body-frame offset from the
+    // midpoint as learned from paired fixes: no measured lever arm needed.
+    void onReceiverFix(const mavros_msgs::msg::GPSRAW::ConstSharedPtr msg, size_t i)
+    {
+        ++fix_received_;
+        Receiver& r = receivers_[i];
+        if (msg->fix_type < 3)  // GPS_FIX_TYPE_3D_FIX
+        {
+            r.valid = false;
+            last_fix_status_ = r.topic + " rejected: fix_type " + std::to_string(msg->fix_type);
+            return;
+        }
+        double northing = 0.0, easting = 0.0;
+        char zone[8] = {};
+        utm::toUtm(msg->lat * 1e-7, msg->lon * 1e-7, northing, easting, zone);
+        // Ellipsoid height when the receiver reports it; either way both use the same one.
+        const double alt = static_cast<double>(msg->alt_ellipsoid != 0 ? msg->alt_ellipsoid : msg->alt) * 1e-3;
+        const Eigen::Vector3d p(easting, northing, alt);
+        const int64_t t = ns(msg->header.stamp);
+
+        const double since_last = static_cast<double>(t - r.stamp_ns) * 1e-9;
+        r.velocity = r.valid && since_last > 0.0 && since_last < 0.5
+            ? Eigen::Vector3d((p - r.position) / since_last) : Eigen::Vector3d::Zero();
+        r.valid = true;
+        r.stamp_ns = t;
+        r.position = p;
+        const double h = msg->h_acc > 0 ? msg->h_acc * 1e-3 : 0.0;  // mm; 0 = not reported
+        r.vertical_sigma = msg->v_acc > 0 ? msg->v_acc * 1e-3 : 0.0;
+        r.sigma = (fuse_gps_altitude_ || gps_only_) ? std::max(h, r.vertical_sigma) : h;
+
+        const Receiver& o = receivers_[1 - i];
+        const double to_other = static_cast<double>(t - o.stamp_ns) * 1e-9;
+        if (o.valid && std::abs(to_other) <= pair_max_dt_)
+        {
+            // Moving-baseline RTK: the two errors are almost entirely shared, so the
+            // midpoint is as uncertain as the worse receiver, not less.
+            const Eigen::Vector3d mid = 0.5 * (p + o.position + o.velocity * to_other);
+            learnOffsets(t, p - mid, i);
+            acceptFix(t, msg->header.stamp, mid, zone, std::max(r.sigma, o.sigma),
+                      std::max(r.vertical_sigma, o.vertical_sigma));
+            last_fix_status_ = "valid (antenna midpoint)";
+            return;
+        }
+        if (r.samples >= min_offset_samples_ && have_heading_)
+        {
+            const Eigen::Vector2d off = Eigen::Rotation2Dd(heading_) * r.offset;
+            acceptFix(t, msg->header.stamp, p - Eigen::Vector3d(off.x(), off.y(), 0.0), zone,
+                      r.sigma, r.vertical_sigma);
+            last_fix_status_ = "valid (" + r.topic + " alone)";
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                                 "Only %s has a fix: using it alone, offset (%.2f, %.2f) m FLU from the midpoint",
+                                 r.topic.c_str(), r.offset.x(), r.offset.y());
+            return;
+        }
+        last_fix_status_ = "waiting: only " + r.topic + " has a fix and its offset is not learned yet";
+    }
+
+    // Body-frame (FLU) offset of each antenna from the midpoint, a running mean
+    // over paired fixes. The heading prior arrives ~0.24 s late (heading.time_offset),
+    // so only learn while it is barely turning.
+    void learnOffsets(int64_t t, const Eigen::Vector3d& from_mid, size_t i)
+    {
+        if (!have_heading_ || std::abs(heading_rate_) > 0.1 ||
+            std::abs(static_cast<double>(t - gnss_heading_ns_)) * 1e-9 > 1.0)
+            return;
+        const Eigen::Vector2d body = Eigen::Rotation2Dd(-heading_) * from_mid.head<2>();
+        for (size_t k = 0; k < 2; ++k)
+        {
+            Receiver& r = receivers_[k];
+            const Eigen::Vector2d sample = k == i ? body : Eigen::Vector2d(-body);
+            r.samples = std::min<size_t>(r.samples + 1, 1000);  // beyond 1000: an EMA
+            r.offset += (sample - r.offset) / static_cast<double>(r.samples);
+        }
+        if (!offsets_reported_ && receivers_[0].samples >= min_offset_samples_)
+        {
+            offsets_reported_ = true;
+            const Eigen::Vector2d baseline = receivers_[0].offset - receivers_[1].offset;
+            RCLCPP_INFO(this->get_logger(),
+                        "Antenna offsets from the midpoint (FLU): %s (%.3f, %.3f), %s (%.3f, %.3f); "
+                        "baseline %.3f m",
+                        receivers_[0].topic.c_str(), receivers_[0].offset.x(), receivers_[0].offset.y(),
+                        receivers_[1].topic.c_str(), receivers_[1].offset.x(), receivers_[1].offset.y(),
+                        baseline.norm());
+        }
+    }
+
+    // A fix in UTM easting/northing/altitude, from either input path.
+    void acceptFix(int64_t fix_ns, const builtin_interfaces::msg::Time& stamp, const Eigen::Vector3d& utm,
+                   const char* zone, double sigma, double vertical_sigma)
+    {
+        ++fix_valid_;
+        last_valid_fix_received_ = StatusClock::now();
+
+        if (!datum_set_)
+        {
+            // Local metric frame: absolute UTM northings destroy float32 precision downstream.
+            datum_ = utm;
+            zone_ = zone;
+            datum_set_ = true;
+            RCLCPP_INFO(this->get_logger(), "datum: zone %s easting %.2f northing %.2f alt %.2f",
+                        zone_.c_str(), utm.x(), utm.y(), utm.z());
+            publishWorldToMap(stamp);
+        }
+
+        Eigen::Vector3d local = utm - datum_;
         // rel_altitude is already relative to home (and FCU-fused, not a raw
         // single fix), so it replaces the datum-differenced z outright rather
         // than needing datum_.z() subtracted from it too.
         if (have_rel_altitude_) local.z() = rel_altitude_;
-        const int64_t fix_ns = ns(msg->header.stamp);
         if (fallback_enabled_ && !gps_only_)
         {
             // Sim time reads 0 until the first /clock; do not start the grace period on it.
@@ -762,16 +897,12 @@ private:
             recordRaw(fix_ns, local);
         }
         if (!position_alignment_) local -= leverArmOffset();
-        const double vertical_variance = msg->position_covariance[8];
-        const double vertical_sigma = msg->position_covariance_type != sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN &&
-                                      std::isfinite(vertical_variance) && vertical_variance > 0
-            ? std::sqrt(vertical_variance) : 0.0;
         graph_->setGnss(fix_ns, local, sigma, vertical_sigma);
-        if (gps_only_) publishGpsOnly(local, sigma, msg->header.stamp);
+        if (gps_only_) publishGpsOnly(local, sigma, stamp);
         if ((in_fallback_ || degraded_fallback_) && !raw_.empty() && raw_.back().stamp_ns == fix_ns &&
             sigma <= options_.gnss_max_sigma)
-            publishFallback(fix_ns, msg->header.stamp, sigma);
-        if (debug_gnss_only_ && !position_alignment_) publishGnssOnlyDebug(local, msg->header.stamp);
+            publishFallback(fix_ns, stamp, sigma);
+        if (debug_gnss_only_ && !position_alignment_) publishGnssOnlyDebug(local, stamp);
     }
 
     void onRelAltitude(const std_msgs::msg::Float64::ConstSharedPtr msg)
@@ -870,6 +1001,10 @@ private:
         RCLCPP_INFO_ONCE(this->get_logger(),
                          "GNSS heading from %s (sigma %.3f deg, fix_type %u)",
                          topic.c_str(), sigma * 180.0 / M_PI, msg->fix_type);
+        const int64_t heading_ns = ns(msg->header.stamp);
+        const double since = static_cast<double>(heading_ns - gnss_heading_ns_) * 1e-9;
+        if (have_heading_ && since > 0.0 && since < 1.0)
+            heading_rate_ = std::remainder(enu - heading_, 2.0 * M_PI) / since;
         heading_ = std::atan2(std::sin(enu), std::cos(enu));
         have_heading_ = true;
         ++heading_valid_;
@@ -1056,6 +1191,24 @@ private:
     double compass_heading_sigma_ = 5.0 * M_PI / 180.0;
     double gnss_heading_sigma_floor_ = 0.005, gnss_heading_sigma_max_ = 0.35;
     int64_t gnss_heading_ns_ = 0;
+    double heading_rate_ = 0.0;  // rad/s, between consecutive GNSS headings
+
+    // gnss.receivers: one entry per antenna.
+    struct Receiver
+    {
+        std::string topic;
+        bool valid = false;
+        int64_t stamp_ns = 0;
+        Eigen::Vector3d position = Eigen::Vector3d::Zero(), velocity = Eigen::Vector3d::Zero();
+        double sigma = 0.0, vertical_sigma = 0.0;
+        Eigen::Vector2d offset = Eigen::Vector2d::Zero();  // FLU, from the midpoint
+        size_t samples = 0;
+    };
+    std::vector<Receiver> receivers_;
+    std::vector<rclcpp::Subscription<mavros_msgs::msg::GPSRAW>::SharedPtr> receiver_subs_;
+    double pair_max_dt_ = 0.25;
+    size_t min_offset_samples_ = 100;
+    bool offsets_reported_ = false;
 
     // Extrapolation state. None of this reaches the graph.
     Eigen::Isometry3d last_odom_pose_ = Eigen::Isometry3d::Identity();
