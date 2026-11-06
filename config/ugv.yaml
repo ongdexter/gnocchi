@@ -1,4 +1,4 @@
-# UGV: RKO-LIO odometry with GNSS position and dual-antenna heading priors.
+# UGV: BIEVR-LIO odometry (RKO-LIO before 2026-11-05) with GNSS position and dual-antenna heading priors.
 # Fuses the RAW fix: it reports the antenna, so the lever arm applies, and it is
 # a measurement rather than an estimator posterior. See README for the rest.
 /**/gnocchi:
@@ -7,7 +7,7 @@
     publish_on_trigger: false
     initialization_trigger_topic: /initialization_trigger
     topics:
-      odom: rko_lio/odometry
+      odom: bievr_lio/odom   # was rko_lio/odometry; sensors.launch.py lio:=rko_lio
       gnss: mavros/global_position/raw/fix
       output_odom: odom_map
       output_odom_throttled: odom_map_throttled
