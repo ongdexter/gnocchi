@@ -14,7 +14,7 @@
     GNSS-to-local-frame converter, which is the UAV profile.
   </description>
   <maintainer email="odexter@engineering.upenn.edu">odexter</maintainer>
-  <license>BSD-3-Clause</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>

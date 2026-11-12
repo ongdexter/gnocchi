@@ -107,3 +107,7 @@ See the [technical reference](docs/technical_reference.md) for frame conventions
 initialization thresholds, covariance and timing, failure handling, fallback,
 height recovery, and validation results. Deployment-specific tuning notes remain
 in the [configuration files](config/).
+
+## License
+
+[MIT](LICENSE).
